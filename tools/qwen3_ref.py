@@ -193,6 +193,35 @@ def build_model(model_path, n_layers=None, dtype=torch.float32, norm_identity=Fa
     return model, reader, cfg, vocab_size, tied
 
 
+def greedy_generate(model, tokens, max_new, stop_ids=None):
+    """贪心解码 max_new 个 token，返回生成的 id 列表（不含输入）。
+
+    刻意**不用** model.generate()：
+      * generate 会挂上一串默认的 logits processor（重复惩罚、min_length、
+        强制 EOS 的时机、多序列收尾……），那些行为随 transformers 版本改；
+      * 我们要的是**最朴素的 argmax** —— 每一步只做"取最大"，与引擎的
+        `GenerateGreedy` 是同一个东西。用 generate 对拍，等于把"引擎对不对"
+        和"processor 配得对不对"混在一起，红了也不知道该怀疑哪边。
+
+    自己走循环 + past_key_values 增量，语义只剩三行。
+    stop_ids 命中时**计入**返回序列（与引擎的行为一致）。
+    """
+    stop = set(stop_ids or [])
+    out = []
+    cur = torch.tensor([list(tokens)], dtype=torch.long)
+    past = None
+    with torch.no_grad():
+        for _ in range(max_new):
+            o = model(cur, past_key_values=past, use_cache=True)
+            past = o.past_key_values
+            nxt = int(torch.argmax(o.logits[0, -1]).item())
+            out.append(nxt)
+            if nxt in stop:
+                break
+            cur = torch.tensor([[nxt]], dtype=torch.long)
+    return out
+
+
 def run_forward(model, tokens, want_hidden=True, hidden_count=None):
     """跑一次前向。
 

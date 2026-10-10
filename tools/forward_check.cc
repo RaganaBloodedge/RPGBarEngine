@@ -24,52 +24,11 @@
 #include <string>
 #include <vector>
 
+#include "cli_util.h"
 #include "common.h"
 #include "model.h"
 #include "npy.h"
 #include "qwen3.h"
-
-namespace {
-
-std::vector<int32_t> ParseTokens(const std::string& s) {
-  std::vector<int32_t> out;
-  size_t i = 0;
-  while (i < s.size()) {
-    while (i < s.size() && (s[i] == ',' || s[i] == ' ')) ++i;
-    if (i >= s.size()) break;
-    char* end = nullptr;
-    const long v = std::strtol(s.c_str() + i, &end, 10);
-    if (end == s.c_str() + i) rpg::Throw("--tokens 里有解析不了的内容：%s", s.c_str() + i);
-    out.push_back(static_cast<int32_t>(v));
-    i = static_cast<size_t>(end - s.c_str());
-  }
-  return out;
-}
-
-bool WriteText(const std::string& path, const std::string& text) {
-  FILE* f = std::fopen(path.c_str(), "wb");
-  if (!f) return false;
-  const bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
-  std::fclose(f);
-  return ok;
-}
-
-// 从文件读 UTF-8 文本。
-// 存在的理由：Windows 上 `cmd`/Git Bash 传给 argv 的字符串会按控制台代码页转码，
-// 中文提示词直接当命令行参数传会被搞坏（实测 "你好" 会变成一坨乱码字节）。
-// 文件路径是 ASCII，内容按字节读，就没有这一层。
-std::string ReadFile(const std::string& path) {
-  FILE* f = std::fopen(path.c_str(), "rb");
-  if (!f) rpg::Throw("读不了文件 %s", path.c_str());
-  std::string s;
-  char buf[4096];
-  size_t n;
-  while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, n);
-  std::fclose(f);
-  return s;
-}
-
-}  // namespace
 
 int main(int argc, char** argv) {
   if (argc < 2) {
@@ -106,7 +65,7 @@ int main(int argc, char** argv) {
       return argv[++i];
     };
     if (a == "--prompt") prompt = next();
-    else if (a == "--prompt-file") prompt = ReadFile(next());
+    else if (a == "--prompt-file") prompt = cli::ReadFile(next());
     else if (a == "--tokens") tokens_arg = next();
     else if (a == "--out") out_prefix = next();
     else if (a == "--threads") threads = std::atoi(next());
@@ -128,7 +87,7 @@ int main(int argc, char** argv) {
 
     std::vector<int32_t> ids;
     if (!tokens_arg.empty()) {
-      ids = ParseTokens(tokens_arg);
+      ids = cli::ParseIds(tokens_arg);
       std::printf("\n[输入] 直接指定 " RPG_SZ " 个 token id\n", RPG_SZ_ARG(ids.size()));
     } else {
       ids = model.tokenizer().Encode(prompt, /*parse_special=*/true);
@@ -189,12 +148,7 @@ int main(int argc, char** argv) {
 
     // ---- 落盘 ----
     std::string tok_txt = out_prefix + ".tokens.txt";
-    std::string body;
-    for (size_t i = 0; i < ids.size(); ++i) {
-      body += std::to_string(ids[i]);
-      body += (i + 1 == ids.size()) ? "\n" : ",";
-    }
-    RPG_CHECK(WriteText(tok_txt, body), "写不了 %s", tok_txt.c_str());
+    cli::WriteIds(tok_txt, ids);
 
     if (!logits.empty()) {
       std::string logits_npy = out_prefix + ".logits.npy";
