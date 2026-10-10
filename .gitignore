@@ -30,6 +30,10 @@ downloads/
 __pycache__/
 *.pyc
 
+# 对拍参考物（分词器定义等，与权重一样可重新下载）
+tools/*.json
+!tools/package.json
+
 # 编辑器
 .vscode/
 .idea/
