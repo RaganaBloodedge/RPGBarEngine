@@ -443,14 +443,28 @@ float DotRowQuant(uint32_t id, const float* a, const uint8_t* w, int64_t k) {
   RPG_CHECK(t != nullptr, "未知的 ggml 类型 id=%u", id);
   RPG_CHECK(k % t->block_elems == 0, "点积长度 %lld 不是块大小 %lld 的整数倍",
             static_cast<long long>(k), static_cast<long long>(t->block_elems));
-  float sum = 0.0f;
+
+  // **多个累加器**，不是图省事，是为了精度。
+  // 单个串行累加器的舍入误差随长度**线性**增长（n 项最多积累 n·u·Σ|term|），
+  // 而 BLAS 的分块/向量化求和是对数级。k 到 6144 时这个差距实测是 4–5 倍 ——
+  // 与 M1 对拍时"我们比参考离真值远 5 倍"的现象完全对得上。
+  // 4 个独立部分和正好对应 M5 里 SIMD 的 4 个 lane，所以这个结构可以直接留用。
+  float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
   const int64_t nb = k / t->block_elems;
   for (int64_t b = 0; b < nb; ++b) {
     DequantizeRow(id, w + b * t->block_bytes, t->block_elems, tmp);
     const float* ap = a + b * t->block_elems;
-    for (int64_t j = 0; j < t->block_elems; ++j) sum += ap[j] * tmp[j];
+    int64_t j = 0;
+    const int64_t lim = t->block_elems - 3;
+    for (; j < lim; j += 4) {
+      s0 += ap[j] * tmp[j];
+      s1 += ap[j + 1] * tmp[j + 1];
+      s2 += ap[j + 2] * tmp[j + 2];
+      s3 += ap[j + 3] * tmp[j + 3];
+    }
+    for (; j < t->block_elems; ++j) s0 += ap[j] * tmp[j];
   }
-  return sum;
+  return (s0 + s1) + (s2 + s3);
 }
 
 }  // namespace rpg
