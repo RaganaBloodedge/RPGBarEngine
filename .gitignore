@@ -1,0 +1,36 @@
+# 构建产物
+build/
+out/
+cmake-build-*/
+
+# 编译中间件与库
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exp
+*.pdb
+*.exe
+
+# 权重不进版本库（大文件 + 可重新下载）
+models/
+*.gguf
+*.safetensors
+*.bin
+*.sbs
+
+# 下载缓存
+.cache/
+downloads/
+
+# Python 工具脚本
+__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
