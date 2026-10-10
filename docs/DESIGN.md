@@ -1,7 +1,22 @@
 # RPGBarEngine 设计
 
-> 状态：**设计稿 v1**（选型待确认）
+> 状态：**M0 已完成**（GGUF 解析 + 量化解码 + BBPE 分词器，全部通过独立验证）。
+> 选型已定：**Qwen3-1.7B / Qwen3-4B**（用户 2026-10-10 拍板）。
 > 关联：`RPGBar-Unity/docs/ENGINE-ARCHITECTURE.md`（Agent 与 Provider 层设计）
+
+---
+
+## 0. 当前进度
+
+| 里程碑 | 状态 | 证据 |
+| --- | --- | --- |
+| M0 GGUF 解析 + 量化解码 + 分词器 | **完成** | `tools/run_checks.sh` 全绿（见 §13） |
+| M1 Qwen3 前向（标量） | 待开始 | — |
+| M2 KV Cache + 采样 | 待开始 | — |
+| M3 ChatML 模板 + tool_call 解析 | 待开始 | — |
+| M4 C ABI 落地 | 占位实现已可加载 | 10 个导出函数实测可被 Python 加载 |
+| M5 SIMD 多线程 GEMM | 待开始 | — |
+| M6 交叉编译 + 宿主打通 | 构建链已通 | `build/rpg_engine.dll` 零告警构建 |
 
 ---
 
@@ -63,8 +78,8 @@ DM 只能输出文本、**改不了任何状态**。
 - GGUF 规范公开、可自写解析器，不需要引入 llama.cpp 的构建体系；
 - 保留升级到 Q5/Q8 或 fp16 的余地（同格式、不同量化类型）。
 
-> 本文所有超参（层数 / hidden / 头数 / rope_theta）在**实现前必须用官方 `config.json` 与权重头核对**，
-> 下表为工作假设：
+> **超参已实测确认**（不是假设）：官方 `config.json` + GGUF 元数据 + 张量清单三方
+> 交叉核对，见 §13.2。
 >
 > | | Qwen3-1.7B | Qwen3-4B |
 > | --- | --- | --- |
@@ -75,6 +90,10 @@ DM 只能输出文本、**改不了任何状态**。
 > | head_dim | 128 | 128 |
 > | intermediate | 6144 | 9728 |
 > | vocab | 151936 | 151936 |
+> | rope_theta | 1e6 | 1e6 |
+> | rms_eps | 1e-6 | 1e-6 |
+> | tied lm_head | 是（无 `output.weight`） | 是 |
+> | 每层张量数 | 11 | 11 |
 
 ---
 
@@ -255,10 +274,124 @@ C++ 没有稳定 ABI —— 不同编译器、不同 STL 版本之间传 `std::s
 
 ---
 
-## 12. 待确认
+## 12. 已定事项
 
-| # | 问题 | 建议 |
+| # | 问题 | 结论 |
 | --- | --- | --- |
-| 1 | **模型族**：Qwen3（1.7B / 4B）还是别的 | **Qwen3** —— 档位最贴合、Apache-2.0、一套架构覆盖两档、原生工具调用且可控思考模式 |
-| 2 | 量化档位：Q4_K_M 起步，是否同时出 Q5/Q8 | **先只做 Q4_K_M**，打通后再加档 |
-| 3 | 上下文长度上限：2048 / 4096 / 8192 | **4096** 起（DM 要装剧本片段 + 历史），按显存/内存实测调 |
+| 1 | **模型族** | **Qwen3**（2026-10-10 拍板）：1.7B / 4B 正好对上"小规模 2B / 大规模 4B"；Apache-2.0 可自由再分发；原生 tool calling；可控思考模式 |
+| 2 | 量化档位 | 目标 **Q4_K_M**；对拍基准用官方 **Q8_0**（几乎无损，能把"量化误差"和"实现错误"分开） |
+| 3 | 上下文长度上限 | 暂定 4096，实测后调 |
+| 4 | 权重是否随包 | 两档随包（Q4_K_M 1.03 GiB + 4B 约 2.5 GiB），首启校验 |
+| 5 | 引擎是否支持多模型族 | **先只做 Qwen3**；但架构不写死（配置全从 GGUF 读），后续要扩族是"加一个前向 + 一套模板"，不是重写 |
+
+---
+
+## 13. M0 落地记录（已完成）
+
+### 13.1 交付物
+
+```
+include/rpg_engine.h      C ABI（10 个函数，两级句柄）
+src/
+  common.h/.cc            错误（异常 → ABI 边界翻译）、日志
+  bytes.h                 小端读取游标、对齐
+  dtypes.h                f32/f16/bf16 互转（RNE 舍入）
+  unicode.h                UTF-8 编解码、\p{L}/\p{N}/\s、GPT-2 字节⇄码点
+  unicode_tables.h        **生成物**（tools/gen_unicode_tables.py）
+  json.h/.cc              最小 JSON（解析/序列化，零依赖）
+  mmap_file.h/.cc         跨平台只读 mmap（Windows/POSIX）
+  threads.h/.cc           物理核探测 + 自研常驻线程池
+  quant.h/.cc             ggml 类型表 + 15 种类型的反量化
+  gguf.h/.cc              GGUF v1/v2/v3 解析（mmap 零拷贝）
+  tokenizer.h/.cc         Qwen BBPE（特殊 token 切分 + 手写预分词正则 + BPE 合并）
+  rpg_engine.def          Windows 导出清单
+  engine_stub.cc          C ABI 占位（M4 替换）
+tools/
+  dump_gguf.cc            检视 GGUF + 抽样反量化
+  tok_check.cc            分词对拍协议进程（NUL 分隔）
+  selftest.cc             69 项进程内自检
+  gen_unicode_tables.py   生成 Unicode 范围表
+  check_quant_layout.py   用文件 offset 独立验证块尺寸
+  tok_ref.py              HF tokenizers 对拍
+  xcheck_quant.py         跨量化档位交叉校验
+  run_checks.sh           一条命令跑完所有检查
+scripts/fetch_model.py    权重与对拍参考物下载（断点续传，走 hf-mirror）
+```
+
+### 13.2 已确认的事实（不是假设）
+
+从官方 `config.json`、GGUF 元数据、张量清单三方核对：
+
+- Qwen3 的 GGUF 架构键前缀是 `qwen3.`；`head_dim` 单独落在
+  `qwen3.attention.key_length`（**不等于** `hidden / heads`，必须单独读）。
+- `tokenizer.ggml.pre = "qwen2"` → 预分词走 LLAMA_VOCAB_PRE_TYPE_QWEN2 的模式。
+- `tokenizer.ggml.model = "gpt2"` → byte-level BPE，merges 共 151387 条。
+- **无 `output.weight`** → tied embeddings，lm_head 复用 `token_embd.weight`。
+- 每层 11 个张量：`attn_{q,k,v,output,q_norm,k_norm}`、`attn_norm`、
+  `ffn_{gate,up,down}`、`ffn_norm`。
+- GGUF 的 `dims[0]` 是最快维，所以权重在内存里是行主 `[rows=dims[1], cols=dims[0]]`
+  —— 正好是 `out = x · Wᵀ` 需要的布局。
+- 张量类型分布能直接看出档位：Q8_0 文件是 `F32×113 + Q8_0×197`；
+  Q4_K_M 是 `F32×113 + Q4_K×168 + Q6_K×29`（K-quant 混合量化的典型形状）。
+
+### 13.3 M0 阶段做的几个设计决定
+
+1. **并行后端不用 OpenMP，自研常驻线程池。**
+   这个库要直接丢进 Unity 游戏。libgomp / vcomp 是额外的运行时依赖，
+   缺了就是"加载失败"，宿主自己用 OpenMP 时还会撞车。而且 decode 是
+   "很多次很小的并行区"，OpenMP 每轮 fork/join 的开销在此不可忽略。
+
+2. **权重走 mmap，不整份读进堆。**
+   1.8 GB 读进 `vector` 会让峰值内存翻倍（页缓存 + 副本）。mmap 之后张量数据
+   就是文件页，未触碰的层不占物理内存。
+
+3. **不引正则库，手写 qwen2 预分词。**
+   那个模式只用一个分支、几个字符类和一个负向前瞻，但通用正则引擎要支持
+   Unicode 类别与回溯语义，代价远大于收益。手写版本按分支顺序与贪婪/回溯行为
+   逐条对齐 Rust regex 的"最左优先"语义，再用 3000 条随机文本对拍验证。
+
+4. **Unicode 类别用生成表，不用手写近似。**
+   手写"ASCII + CJK 区间"在韩文、希腊字母、全角数字上会静默切错。范围表由
+   `tools/gen_unicode_tables.py` 从 UCD 扫全码位生成（约 5 KB），可复现。
+
+5. **`%zu` 全项目禁用。**
+   MinGW 的 printf 走 MSVCRT，不支持 `%zu`，会静默输出乱码。统一用
+   `RPG_SZ` / `RPG_SZ_ARG` 宏（展开成 `%llu` + 转换）。
+
+6. **Windows 导出用显式 `.def`。**
+   不给 `.def` 时 MinGW ld 会导出**全部**符号 —— 实测有 200+ 条，含内部 C++
+   修饰名与 libgcc 的 `_Unwind_*`。现在导出表恰好 10 个 C 函数。
+
+### 13.4 已知差异（刻意保留）
+
+**不做 NFC 归一化。** Qwen3 的 `tokenizer.json` 里声明了 `normalizer: NFC`，
+但 llama.cpp 对 BPE 不做任何 Unicode 归一化。我们的端到端基准是 llama.cpp，
+所以选择与它一致：
+
+- 输入已是 NFC（绝大多数中英文本、以及我们自己的 chat 模板输出）→
+  与 HF tokenizers **完全一致**；
+- 输入是分解形式（如 `e` + U+0301）→ 会与 HF 不同。
+
+要补的话需要完整的 NFC 表与"重排 + 组合"算法，属于独立工作。
+当前对拍脚本把所有语料先归一成 NFC，保证比较的是同一件事。
+
+### 13.5 M0 的验证结果（三层，逐条可复现）
+
+| 层 | 手段 | 结果 |
+| --- | --- | --- |
+| 进程内自检 | `build/selftest.exe` | **69/69**（字节读写、UTF-8、字节⇄码点双射、Unicode 类别、JSON、简单量化） |
+| 量化块尺寸 | `check_quant_layout.py`，用 GGUF 写入器算出的 offset 反推 | Q8_0 1.0625、Q4_K 0.5625、Q6_K 0.8203125、Q2_K 0.328125、Q3_K 0.4296875、Q5_K 0.6875 **全部与实现表一致**；四个文件的张量无缝铺满，推算总长与文件大小**逐字节相同** |
+| 量化语义 | `xcheck_quant.py`：Q8_0 与 Q4_K_M 同一张量 | 相关系数 **0.9966–0.9998**（符合 4-bit 量化噪声）；F32 张量**逐位相同** |
+| 分词 | `tok_ref.py` 对 82 条构造用例 + 3000 条随机模糊用例 | **3031/3031 逐 id 一致**（HF `tokenizers` 为参考） |
+
+> 为什么"量化块尺寸"要用文件 offset 来验：这张表**写错了不会报错**，
+> 只会读错字节，最后表现为模型胡说八道。而 GGUF 的 offset 是写入器按它自己的
+> 尺寸表算的，与我们的实现完全独立 —— 两者一致，才算把这张表钉死。
+
+### 13.6 下一步（M1）
+
+1. 标量 Qwen3 前向（无 KV Cache），先跑通一条 prompt。
+2. 与 PyTorch 参考实现对拍：逐张量误差 < 1e-4。参考侧要用**原始 bf16
+   safetensors**（不是 GGUF），这样"量化误差"与"实现错误"才能分开归因。
+3. 通过后再加 KV Cache（M2）与 ChatML 模板（M3）。
+
