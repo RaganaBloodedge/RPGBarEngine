@@ -18,6 +18,27 @@
 
 #include <stdint.h>
 
+/* 导出标记。
+ *
+ * 为什么不用 MinGW 的"自动导出全部符号"：那会把内部 C++ 符号（含 std::string
+ * 的模板实例、线程池、GGUF 读取器……）连同 libgcc 的 _Unwind_* 一起塞进导出表，
+ * 既有几百个无意义条目，也等于把内部 ABI 暴露给宿主。宿主只需要这 10 个函数。
+ *
+ * 所以 Windows 上配 rpg_engine.def 精确列出导出；这里额外挂 dllexport 只是让
+ * MSVC 构建（没有 .def）也能用。非 Windows 走默认可见性。
+ */
+#if defined(_WIN32)
+#if defined(RPG_ENGINE_BUILD)
+#define RPG_API __declspec(dllexport)
+#else
+#define RPG_API
+#endif
+#elif defined(__GNUC__)
+#define RPG_API __attribute__((visibility("default")))
+#else
+#define RPG_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -28,32 +49,34 @@ extern "C" {
 /* ---------------------------------------------------------------- 版本 */
 
 /* 引擎版本字符串，如 "0.1.0"。 */
-const char* rpg_engine_version(void);
+RPG_API const char* rpg_engine_version(void);
 
 /* 最近一次错误信息（线程局部，勿释放，下一次调用会被覆盖）。 */
-const char* rpg_engine_last_error(void);
+RPG_API const char* rpg_engine_last_error(void);
 
 /* ---------------------------------------------------------------- 模型 */
 
 /* 加载权重。model_path 为 GGUF 文件路径；config_json 可覆盖运行时参数
  * （线程数、上下文长度等），传 NULL 用默认值。
  * 返回模型句柄，失败返回负数。 */
-int32_t rpg_engine_load_model(const char* model_path, const char* config_json);
+RPG_API int32_t rpg_engine_load_model(const char* model_path,
+                                      const char* config_json);
 
 /* 卸载模型，并销毁其下所有会话。model 无效时为空操作。 */
-void rpg_engine_unload_model(int32_t model);
+RPG_API void rpg_engine_unload_model(int32_t model);
 
 /* ---------------------------------------------------------------- 会话 */
 
 /* 在模型上创建会话。session_json 可指定该会话的生成参数默认值，传 NULL 用默认值。
  * 返回会话句柄，失败返回负数。 */
-int32_t rpg_engine_session_create(int32_t model, const char* session_json);
+RPG_API int32_t rpg_engine_session_create(int32_t model,
+                                          const char* session_json);
 
 /* 销毁会话并释放其 KV Cache。 */
-void rpg_engine_session_destroy(int32_t session);
+RPG_API void rpg_engine_session_destroy(int32_t session);
 
 /* 清空会话的 KV Cache 与消息历史，保留配置与会话句柄本身。 */
-int32_t rpg_engine_session_reset(int32_t session);
+RPG_API int32_t rpg_engine_session_reset(int32_t session);
 
 /* ---------------------------------------------------------------- 生成 */
 
@@ -82,16 +105,16 @@ int32_t rpg_engine_session_reset(int32_t session);
  *
  * 会话按轮次追加：调用方把完整的 messages 传进来即可，引擎负责与已有 KV Cache
  * 做最长公共前缀匹配以复用（或由调用方用 session_reset 显式重置）。 */
-char* rpg_engine_generate(int32_t session, const char* request_json);
+RPG_API char* rpg_engine_generate(int32_t session, const char* request_json);
 
 /* 释放由引擎分配的字符串（rpg_engine_generate 的返回值）。 */
-void rpg_engine_free(char* buf);
+RPG_API void rpg_engine_free(char* buf);
 
 /* ---------------------------------------------------------------- 自省 */
 
 /* 返回模型元信息 JSON（层数、维度、上下文长度、词表大小等），用于宿主自检。
  * 调用方负责 rpg_engine_free。 */
-char* rpg_engine_model_info(int32_t model);
+RPG_API char* rpg_engine_model_info(int32_t model);
 
 #ifdef __cplusplus
 } /* extern "C" */
