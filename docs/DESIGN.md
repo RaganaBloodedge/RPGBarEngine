@@ -1,7 +1,8 @@
 # RPGBarEngine 设计
 
-> 状态：**M1 已完成**（Qwen3 标量前向，与 PyTorch 官方实现逐层对拍通过）。
+> 状态：**M2 已完成**（KV Cache + 贪心解码，逐 token 与 PyTorch 官方实现一致）。
 > 选型已定：**Qwen3-1.7B / Qwen3-4B**（用户 2026-10-10 拍板）。
+> **随机性归属已拍板**：引擎不产随机数（§12 #6）。
 > 关联：`RPGBar-Unity/docs/ENGINE-ARCHITECTURE.md`（Agent 与 Provider 层设计）
 
 ---
@@ -12,7 +13,8 @@
 | --- | --- | --- |
 | M0 GGUF 解析 + 量化解码 + 分词器 | **完成** | `tools/run_checks.sh` 第 1–5 层全绿（见 §13） |
 | M1 Qwen3 前向（标量） | **完成** | 3 个组合 × 29 项对拍全绿（见 §14） |
-| M2 KV Cache + 采样 | 待开始 | — |
+| M2 KV Cache + 贪心解码 | **完成** | 3 个组合逐 token 一致 + cache 自检逐位相同（见 §15） |
+| M2.5 采样（温度 / top-p） | **未做**（等 §12 #6 的接口形状定案） | 引擎只出分布，随机数由宿主给 |
 | M3 ChatML 模板 + tool_call 解析 | 待开始 | — |
 | M4 C ABI 落地 | 占位实现已可加载 | 10 个导出函数实测可被 Python 加载 |
 | M5 SIMD 多线程 GEMM | 待开始 | — |
@@ -108,7 +110,7 @@ DM 只能输出文本、**改不了任何状态**。
         ├── Tokenizer        BBPE（Qwen 词表 151936）+ 特殊 token
         ├── Template         Qwen3 ChatML 渲染（含 tools）+ tool_call 解析
         ├── Model            权重常驻：GGUF 加载 → 量化张量 → 融合 GEMM
-        ├── Session          KV Cache + 消息历史 + 采样器状态
+        ├── Session          KV Cache + 消息历史 + 采样参数（温度 / top-p）
         └── Kernels          RMSNorm / QK-norm / RoPE / SwiGLU / GEMM / Attention
 ```
 
@@ -251,7 +253,8 @@ C++ 没有稳定 ABI —— 不同编译器、不同 STL 版本之间传 `std::s
 | --- | --- | --- |
 | **M0** | GGUF 解析 + BBPE tokenizer | 对一段已知文本，tokenizer 与官方逐 id 一致 |
 | **M1** | Qwen3 前向（无 KV Cache，标量） | 与 PyTorch 官方实现逐层对拍：**逐元素相对误差 p99 ≤ 2e-4，且每个位置的 argmax 一致**（判据修正的经过见 §14.2） |
-| **M2** | KV Cache + 采样（贪心 / top-p） | 贪心解码 N 个 token 与官方逐 token 一致 |
+| **M2** | KV Cache + 贪心解码 | 贪心解码 N 个 token 与官方**逐 token** 一致（**已通过**，见 §15） |
+| **M2.5** | 采样（温度 / top-p） | 接口形状待定（§12 #6）。抽样**不在引擎内**，引擎只出确定性分布 |
 | **M3** | ChatML 模板 + tool_call 解析 | 给定工具定义，能稳定产出结构化 `tool_calls` |
 | **M4** | C ABI + 多会话 | 同一模型两个会话互不干扰（对拍验证） |
 | **M5** | SIMD / 多线程 GEMM（移植 TinyGemmaCpp） | 达到 §9 性能目标 |
@@ -261,7 +264,7 @@ C++ 没有稳定 ABI —— 不同编译器、不同 STL 版本之间传 `std::s
 
 ## 11. 验证方法
 
-沿用 TinyGemmaCpp 已验证的分层对拍（每层都留可复现脚本），现在有六层：
+沿用 TinyGemmaCpp 已验证的分层对拍（每层都留可复现脚本），现在有七层：
 
 | 层 | 对拍对象 | 判据 | 对应脚本 |
 | --- | --- | --- | --- |
@@ -271,9 +274,19 @@ C++ 没有稳定 ABI —— 不同编译器、不同 STL 版本之间传 `std::s
 | 4 分词 | 官方 tokenizer | 逐 **id** 一致 | `tok_ref.py` |
 | 5 跨量化档位 | Q8_0 与 Q4_K_M 的同一张量 | 高相关；F32 张量逐位相同 | `xcheck_quant.py` |
 | 6 前向（M1） | PyTorch 官方 `Qwen3ForCausalLM` | **相对误差 p99 ≤ 2e-4 且 argmax 一致** | `check_forward.py` |
+| 7 生成（M2） | PyTorch 官方 `Qwen3ForCausalLM` | **逐 token** 相同（比第 6 层更硬） | `check_generate.py` |
 
 **为什么第 6 层是"相对误差"而不是"绝对误差"**：见 §14.2 —— 残差流里有一个
 量级 1.2e4 的离群维度，在那里 float32 的 1 ULP ≈ 1e-3，绝对判据失去意义。
+
+**为什么第 7 层比第 6 层硬**：第 6 层只要求"分布差得足够小"，一个 1e-6 的偏差
+只要不改变 argmax 就算过；第 7 层要求**每一步的 argmax 都对** —— 错一步，
+后面全部跟着变（自回归会把误差放大）。而且它顺带把 KV Cache 也验了（跑的是
+增量路径）。
+
+**第 7 层还内置一条自检**：`gen_check` 会把"带 cache 的 prefill"与"不带 cache
+的全序列"的 logits **逐位**比一次。这条能一次性证明 cache 的写入/读取没把布局
+搞错 —— 布局错了不会崩，只会让生成结果慢慢跑偏，那种最难查。
 
 **为什么第 3 层必须逐位**：量化解码有损，一旦解码有偏差，上层的"误差很小"
 可能是错的巧合。只有先钉死"同一份量化字节解出来同一个数"，上层的数值差异
@@ -290,6 +303,8 @@ C++ 没有稳定 ABI —— 不同编译器、不同 STL 版本之间传 `std::s
 | 3 | 上下文长度上限 | 暂定 4096，实测后调 |
 | 4 | 权重是否随包 | 两档随包（Q4_K_M 1.03 GiB + 4B 约 2.5 GiB），首启校验 |
 | 5 | 引擎是否支持多模型族 | **先只做 Qwen3**；但架构不写死（配置全从 GGUF 读），后续要扩族是"加一个前向 + 一套模板"，不是重写 |
+| 6 | **随机性归属**（用户 2026-10-10 拍板） | **引擎不产随机性**。温度 / top-p / top-k 是**宿主侧参数**：引擎只做确定性的"算分布 + 筛选"，"按概率抽一个"由宿主完成（宿主传一个 `[0,1)`，引擎按累积概率做逆变换）。因此**引擎内没有 RNG**，同一输入必得同一输出。三条理由：① 对齐 RPGBar 的"骰子只有一个来源" —— 模型/引擎只产出权重或分布，从不自己掷骰；② 随机流集中在宿主侧，**整局对局可复现**（同种子 + 同输入 → 同剧情），且多会话（DM / 小助手）不会互相扰动随机流；③ 引擎是**纯函数**，最好对拍、最好排错。玩家侧"创造力开关" = 宿主配置里的 `temperature`，DM 与小助手各自可调 |
+| 7 | 采样是否属于引擎 | **不属于**。引擎只提供 `sample_probs`（温度/截断/重归一化，纯函数）。M2 阶段先只做**贪心**（零随机数） |
 
 ---
 
@@ -534,10 +549,117 @@ O(1) 而不是 O(1e-6)。
 
 ### 14.6 下一步（M2）
 
-1. KV Cache。布局按 GQA：`[n_layers, n_kv_heads, max_seq, head_dim]`，
-   K 与 V 分开两块连续内存。`ForwardLayer` 里的 `CausalAttention` 换成
-   增量版本（只算当前 token 对历史 + 自己的注意力），其余算子原样复用。
-2. 采样：贪心 + top-p + 温度。**骰子/随机数的唯一来源留在宿主侧**（对齐
-   RPGBar 的"骰子只有一个来源"原则），引擎只接受一个 seed 或一个外部采样器。
-3. 判据：贪心解码 N 个 token 与官方逐 token 一致（比 logits 对拍更硬 ——
-   它要求每一步的 argmax 都对，误差会在解码过程中被放大检验）。
+**M2 已完成**，落地记录见 §15。当时的计划是：
+
+1. KV Cache，布局 `[n_layers, n_kv_heads, max_seq, head_dim]`，K 与 V 分开
+   两块连续内存；`ForwardLayer` 换成带 cache 的版本。
+2. 采样：**M2 只做贪心**（零随机数，判据可硬对拍）。温度 / top-p 的确定性
+   筛选是独立的一步（见 §12 #6）：引擎算出候选分布，抽样由宿主给一个 `[0,1)`。
+   引擎内**不设 RNG** —— 用户明确要求"保持引擎的纯净，因为这是可以分离的设计"。
+   （本节最初写的"引擎只接受一个 seed"是错的，与同句前半段自相矛盾，已改掉）
+3. 判据：贪心解码 N 个 token 与官方逐 token 一致。
+
+三条都按计划做到了（第 1 条的实现比原计划更好：没有另写一套增量代码，而是让
+同一个 `ForwardLayer` 同时支撑两条路径，于是"填 cache"与"不填 cache"可以互相
+印证）。
+
+---
+
+## 15. M2 落地记录（已完成）
+
+### 15.1 交付物
+
+```
+src/kv_cache.h/.cc       KvCache：布局 [n_layers, n_kv_heads, max_seq, head_dim]
+src/qwen3.h/.cc          + ForwardStep（单 token 增量）、GenerateGreedy（贪心）
+                         + AttentionFromCache（从 cache 读历史的因果注意力）
+src/kernels.h            + ArgMax（并列取最小下标，与 torch.argmax 一致）
+tools/gen_check.cc       生成探针：prefill → 贪心生成 → 写盘 + cache 自检
+tools/cli_util.h         工具公共件（id 列表解析 / 按字节读写 / 二进制 stdio）
+tools/check_generate.py  M2 一次性跑完所有组合（逐 token 比）
+tools/run_checks.sh      扩到七层
+```
+
+### 15.2 关键实现决定：**不写第二套前向**
+
+原计划是"另写一个增量版 attention"。实际做法是让**同一个 `ForwardLayer` 同时
+支撑两条路径**，靠三个参数区分：
+
+| 场景 | seq | pos0 | kv |
+| --- | --- | --- | --- |
+| 全序列（M1） | N | 0 | nullptr |
+| prefill | N | cache.len() | 非空 |
+| 增量解码 | 1 | cache.len() | 非空 |
+
+这么切带来三个好处：
+
+1. **两条路径能互相印证**。同一段 prompt，"填 cache 的 prefill"与"不填 cache 的
+   全序列"走的是同一份代码、同一套累加顺序，所以 logits 必须**逐位相同**。
+   这条断言被 `gen_check` 当自检跑：实测 759680 与 9723904 个数值**全部逐位相同**。
+   cache 布局写错（头与位置顺序颠倒、stride 算错……）不会崩，只会让生成结果
+   慢慢跑偏 —— 那种 bug 极难查，而这条自检把它变成一次断言。
+2. **不会出现"两条路径行为不一致"**。另写一份增量 attention 的话，任何一处
+   QK-norm / RoPE 的位置差异都会变成"prefill 与 decode 对不上"，而且归因困难。
+3. 增量只是 seq=1 的特例，不需要额外维护一套代码。
+
+### 15.3 一个差点漏掉的不变量
+
+`GenerateGreedy` 第一版在生成最后一个 token 后**没有**再走一步前向（理由是
+"不需要下一个 token 的 logits"），于是 cache 长度成了 `prompt + N - 1`。
+
+这不是崩溃，是更糟的东西：**短一个**。下一轮对话在 cache 上续写时会缺一个位置
+的 K/V，模型看到的历史比实际少一个 token —— 不报错，只让输出悄悄变味。
+
+已改成：**每个返回的 token 都写进 cache，包括最后一个与停止 token**。代价是末尾
+多算一步前向（约 0.1 秒），换来一条可一句话验证的不变量：
+
+```
+cache.len() == prompt 长度 + 返回的 token 数
+```
+
+`gen_check` 会打印它（实测 5 + 16 = 21）。
+
+### 15.4 验证结果
+
+`python tools/check_generate.py`，判据"逐 token 相同"：
+
+| 组合 | 提示词 | prompt | 生成 | 结果 |
+| --- | --- | --- | --- | --- |
+| q8_ascii | `The capital of France is` | 5 | 24 | **24/24 一致** |
+| q8_zh | 中文 ChatML（含特殊 token） | 64 | 24 | **24/24 一致** |
+| q4_zh | 同上，换 Q4_K_M 权重 | 64 | 24 | **24/24 一致** |
+
+KV Cache 自检（带 cache vs 不带 cache 的 prefill，逐位比）：
+
+| 组合 | 比较的数值个数 | 结果 |
+| --- | --- | --- |
+| q8_ascii | 759680 | 逐位相同 |
+| q8_zh | 9723904 | 逐位相同 |
+
+旁证：`The capital of France is` 诚实往下续写成
+`Paris. The capital of the United States is Washington, D.C. The capital of the
+United Kingdom is London. The` —— 24 步里没有跑偏、没有重复。
+
+### 15.5 已知限制
+
+- **decode 约 9 tok/s**（Q8_0，单 token 前向约 108 ms）。这是纯标量
+  `DotRowQuant` 的必然结果（读每个权重元素都要现反量化一次），M5 用
+  SIMD + 融合反量化点积解决，目标 §9 的 100 tok/s。
+- **prefill 仍是整段全序列**，没有分块，64 token 约 6.6 s。M5 一并解决。
+- **attention 仍走标量、单线程**。按 head 并行不改每个输出的累加顺序（可以并行），
+  但当前瓶颈不在这里，留到 M5 与 GEMM 一起做。
+- **cache 只支持顺序追加**。多轮对话靠"前缀复用"：`ForwardFull` 已支持从
+  `cache.len()` 继续 prefill，但"算出与上一轮的最长公共前缀"由宿主负责（M3/M4 落）。
+- **上下文满了明确报错**，不静默截断 —— 静默停下会让人以为"模型自己讲完了"，
+  而实际是宿主把 `max_seq` 配小了。
+- **采样（温度 / top-p）还没有代码**。M2 只做了贪心。见 §12 #6。
+
+### 15.6 下一步
+
+1. **M3 ChatML 模板 + tool_call 解析**（优先）：Qwen3 的 `<|im_start|>` /
+   `<|im_end|>`，`enable_thinking=false` 时要在 prompt 里放一个空的
+   ` thinking\n\n\n\n`，以及从输出里解析 `tool_calls`。做完这一步，宿主侧
+   `server/agents/*` 的提示词才真正能跑在本引擎上。
+2. **M2.5 采样**：接口形状按 §12 #6 —— 引擎出确定性分布，随机数由宿主给。
+   M3 优先于它：DM 生成要的是**稳定的结构化输出**（温度 0 就够），而工具调用
+   是硬需求；"创造性"这个旋钮是给想调的人调的，不是主路径。
