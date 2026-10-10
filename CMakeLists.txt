@@ -29,6 +29,7 @@ set(RPG_SOURCES
   src/gguf.cc
   src/tokenizer.cc
   src/model.cc
+  src/kv_cache.cc
   src/qwen3.cc
 )
 
@@ -64,9 +65,9 @@ set_target_properties(rpg_engine PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
-# 命令行工具（dump_gguf / tok_check / selftest / forward_check）。
+# 命令行工具（dump_gguf / tok_check / selftest / forward_check / gen_check）。
 # 链接同一批源文件，避免重复编译；不含 engine_stub.cc（工具不走 C ABI）。
-set(RPG_TOOLS dump_gguf tok_check selftest forward_check)
+set(RPG_TOOLS dump_gguf tok_check selftest forward_check gen_check)
 set(RPG_LIB_SOURCES ${RPG_SOURCES})
 list(REMOVE_ITEM RPG_LIB_SOURCES src/engine_stub.cc)
 
