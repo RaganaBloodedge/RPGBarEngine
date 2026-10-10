@@ -1,6 +1,6 @@
 # RPGBarEngine 设计
 
-> 状态：**M0 已完成**（GGUF 解析 + 量化解码 + BBPE 分词器，全部通过独立验证）。
+> 状态：**M1 已完成**（Qwen3 标量前向，与 PyTorch 官方实现逐层对拍通过）。
 > 选型已定：**Qwen3-1.7B / Qwen3-4B**（用户 2026-10-10 拍板）。
 > 关联：`RPGBar-Unity/docs/ENGINE-ARCHITECTURE.md`（Agent 与 Provider 层设计）
 
@@ -10,8 +10,8 @@
 
 | 里程碑 | 状态 | 证据 |
 | --- | --- | --- |
-| M0 GGUF 解析 + 量化解码 + 分词器 | **完成** | `tools/run_checks.sh` 全绿（见 §13） |
-| M1 Qwen3 前向（标量） | 待开始 | — |
+| M0 GGUF 解析 + 量化解码 + 分词器 | **完成** | `tools/run_checks.sh` 第 1–5 层全绿（见 §13） |
+| M1 Qwen3 前向（标量） | **完成** | 3 个组合 × 29 项对拍全绿（见 §14） |
 | M2 KV Cache + 采样 | 待开始 | — |
 | M3 ChatML 模板 + tool_call 解析 | 待开始 | — |
 | M4 C ABI 落地 | 占位实现已可加载 | 10 个导出函数实测可被 Python 加载 |
@@ -250,7 +250,7 @@ C++ 没有稳定 ABI —— 不同编译器、不同 STL 版本之间传 `std::s
 | # | 内容 | 完成判据 |
 | --- | --- | --- |
 | **M0** | GGUF 解析 + BBPE tokenizer | 对一段已知文本，tokenizer 与官方逐 id 一致 |
-| **M1** | Qwen3 前向（无 KV Cache，标量） | 与 PyTorch 参考实现对拍，逐 tensor 误差 < 1e-4 |
+| **M1** | Qwen3 前向（无 KV Cache，标量） | 与 PyTorch 官方实现逐层对拍：**逐元素相对误差 p99 ≤ 2e-4，且每个位置的 argmax 一致**（判据修正的经过见 §14.2） |
 | **M2** | KV Cache + 采样（贪心 / top-p） | 贪心解码 N 个 token 与官方逐 token 一致 |
 | **M3** | ChatML 模板 + tool_call 解析 | 给定工具定义，能稳定产出结构化 `tool_calls` |
 | **M4** | C ABI + 多会话 | 同一模型两个会话互不干扰（对拍验证） |
@@ -261,16 +261,23 @@ C++ 没有稳定 ABI —— 不同编译器、不同 STL 版本之间传 `std::s
 
 ## 11. 验证方法
 
-沿用 TinyGemmaCpp 已验证的三层对拍（每层都留可复现脚本）：
+沿用 TinyGemmaCpp 已验证的分层对拍（每层都留可复现脚本），现在有六层：
 
-| 层 | 对拍对象 | 判据 |
-| --- | --- | --- |
-| 解码 | 量化反解后的权重 | 逐**位模式**一致（不是"误差很小"） |
-| 分词 | 官方 tokenizer | 逐 **id** 一致 |
-| 端到端 | 官方实现（llama.cpp）贪心解码 | 逐 **token** 一致 |
+| 层 | 对拍对象 | 判据 | 对应脚本 |
+| --- | --- | --- | --- |
+| 1 进程内自检 | 自己（不变量） | 69 项全过 | `selftest.cc` |
+| 2 量化布局 | GGUF 写入器算出的 offset | 块尺寸与张量铺满推算一致 | `check_quant_layout.py` |
+| 3 量化语义 | `gguf.quants`（llama.cpp 官方算法） | **逐位**相同 | `xcheck_dequant.py` |
+| 4 分词 | 官方 tokenizer | 逐 **id** 一致 | `tok_ref.py` |
+| 5 跨量化档位 | Q8_0 与 Q4_K_M 的同一张量 | 高相关；F32 张量逐位相同 | `xcheck_quant.py` |
+| 6 前向（M1） | PyTorch 官方 `Qwen3ForCausalLM` | **相对误差 p99 ≤ 2e-4 且 argmax 一致** | `check_forward.py` |
 
-**为什么必须对位对位**：量化解码有损，一旦解码有偏差，后面的"误差很小"可能是错的巧合。
-只有先钉死"同一份权重解出来同一个数"，上层的数值差异才可归因。
+**为什么第 6 层是"相对误差"而不是"绝对误差"**：见 §14.2 —— 残差流里有一个
+量级 1.2e4 的离群维度，在那里 float32 的 1 ULP ≈ 1e-3，绝对判据失去意义。
+
+**为什么第 3 层必须逐位**：量化解码有损，一旦解码有偏差，上层的"误差很小"
+可能是错的巧合。只有先钉死"同一份量化字节解出来同一个数"，上层的数值差异
+才可归因。实测这条已经成立（含 3.1 亿元素的整张词表，逐位相同）。
 
 ---
 
@@ -390,8 +397,147 @@ scripts/fetch_model.py    权重与对拍参考物下载（断点续传，走 hf
 
 ### 13.6 下一步（M1）
 
-1. 标量 Qwen3 前向（无 KV Cache），先跑通一条 prompt。
-2. 与 PyTorch 参考实现对拍：逐张量误差 < 1e-4。参考侧要用**原始 bf16
-   safetensors**（不是 GGUF），这样"量化误差"与"实现错误"才能分开归因。
-3. 通过后再加 KV Cache（M2）与 ChatML 模板（M3）。
+已于本轮完成，落地记录见 **§14**。
 
+> 原计划：标量 Qwen3 前向 → 与 PyTorch 参考对拍（逐张量误差 < 1e-4）。
+> 实际执行时发现"绝对 1e-4"在 float32 下不可达，判据经过修正 —— 见 §14.2。
+
+
+---
+
+## 14. M1 落地记录（已完成）
+
+### 14.1 交付物
+
+```
+src/kernels.h            标量算子：Dot / RmsNorm / Softmax / SiLU / RoPE（M5 换 SIMD 的边界）
+src/model.h/.cc          ModelConfig + QuantMatrix（量化矩阵视图）+ Model::Load（形状全量校验）
+src/qwen3.h/.cc          ForwardScratch + ForwardLayer + CausalAttention + ForwardFull
+tools/npy.h              极小 .npy 写出器（只给 tools 用，避免为对拍引依赖）
+tools/forward_check.cc   跑一次前向，导出 tokens / logits / 逐层残差流为 npy
+tools/qwen3_ref.py       参考侧共用模块：GGUF → 官方 Qwen3ForCausalLM（含精度补丁开关）
+tools/ref_forward.py     参考前向（支持 --layers / --dtype / --norm-identity）
+tools/cmp_npy.py         逐层比较（相对误差分位数），可 import 复用
+tools/check_forward.py   M1 一次性跑完所有组合
+tools/check_noise_floor.py  float32 噪声底诊断（判据的依据）
+tools/xcheck_dequant.py  反量化逐位对拍（vs gguf.quants）
+tests/prompts/zh_chatml.txt  中文 ChatML 长提示词
+```
+
+`Model` 的加载期校验值得单说：张量名、维数、形状、类型全部逐条对，任何一条
+不符立刻抛错并打印"期望 [行,列] / 实际 [行,列]"。**不做"缺了就用默认值兜底"**——
+兜底出来的错误会推迟到几十层之后以 NaN 的形式出现，那时线索全没了。
+
+### 14.2 判据的修正（这是 M1 最重要的一条记录）
+
+**原判据**：逐 tensor 误差 < 1e-4。**实测**：逐层残差流的 `max|Δ| = 0.0117`，
+"超限 100 倍"。但同一份结果的 top-5 token 与参考**完全一致**。
+
+看一眼量级就明白了：
+
+| 项 | 值 |
+| --- | --- |
+| 残差流里有离群维度 | `|h| ≈ 1.19e4`（第 2 层输出出现，之后一直保持） |
+| 该量级下 float32 的 1 ULP | `0.0009765625` |
+| 观测到的 max\|Δ\| | `0.011719` = **恰好 12 ULP** |
+
+也就是说，在 `|h| = 1.2e4` 上，"绝对 1e-4"比一个 ULP 还小 10 倍 ——
+**这个判据在 float32 下不可能满足**，与实现好坏无关。这是判据写错了，
+不是实现错了。
+
+改成**逐元素相对误差的分位数**（只统计 `|ref| > 1e-3` 的元素，剔除近零坐标
+造成的相对误差失真），判据 `p99 ≤ 2e-4`。绝对 max|Δ| 仍然打印，但不作判据：
+它被两类元素主导而失去信息量 —— 巨值维度（ULP 大）与近零坐标（绝对差极小）。
+
+**"2e-4 这个数是怎么来的"** —— 不是拍的，是量出来的（§14.3）。
+
+### 14.3 精度证据链
+
+**第一环：反量化逐位相同。** `xcheck_dequant.py` 把我们的整张张量反量化结果与
+`gguf.quants`（llama.cpp 官方算法的 Python 移植）逐位比：
+
+| 张量 | 形状 | 类型 | 结果 |
+| --- | --- | --- | --- |
+| `blk.0.attn_norm.weight` | (2048,) | F32 | 逐位相同 |
+| `blk.0.attn_q.weight` | (2048, 2048) | Q8_0 | 逐位相同 |
+| `blk.0.ffn_gate.weight` | (6144, 2048) | Q8_0 | 逐位相同 |
+| `blk.0.ffn_down.weight` | (2048, 6144) | Q8_0 | 逐位相同 |
+| `token_embd.weight` | (151936, 2048) | Q8_0 | 逐位相同（3.1 亿元素） |
+| `blk.13.attn_v.weight` | (1024, 2048) | Q8_0 | 逐位相同 |
+| Q4_K_M 版 | 同上四张 | **F32 / Q4_K / Q6_K** | 逐位相同 |
+
+这条排除了"权重本身有偏差"这一类原因 —— 于是上层的差异只可能来自前向的
+浮点运算顺序。
+
+**第二环：量出 float32 的噪声底。** `check_noise_floor.py` 把三个东西放在
+**同一深度**上比：`ours32`（我们）、`ref32`（官方实现，float32）、
+`ref64`（官方实现，float64 ≈ 真值）。其中 ref64 用 `use_exact_rmsnorm()` 打补丁 ——
+官方 `Qwen3RMSNorm` 内部强制把输入降到 float32 再算，不拿掉这个舍入，
+"float64 真值"就不真。
+
+12 层深度下的 p99 相对误差：
+
+| | 我们 | 噪声底（ref32 vs ref64） | 比值 |
+| --- | --- | --- | --- |
+| embedding | 0 | 0 | — |
+| layer 0 | 4.1e-05 | 3.69e-05 | 1.11 |
+| layer 5 | 6.36e-05 | 5.10e-05 | 1.25 |
+| layer 11 | 9.03e-05 | 6.95e-05 | 1.30 |
+
+**比值 1.06–1.40**：我们的相对误差与"float32 + 这套算子"能做到的最好水平
+同量级。这就是"实现没有算法问题"的量化依据，也是 `2e-4` 判据的来源
+（噪声底在 28 层上会到 ~1.5e-4，留一倍余量）。
+
+**第三环：单层可测。** layer 0（一个完整的 transformer 块：pre-norm →
+QKV → QK-norm → RoPE → GQA 因果注意力 → o_proj → pre-norm → SwiGLU）
+在显著元素上的相对误差中位数是 `8.3e-7`。任何一处结构性错误（相邻配对
+RoPE、漏掉 QK-norm、GQA 分组错、漏 silu、多乘 `sqrt(hidden)`）都会让这里是
+O(1) 而不是 O(1e-6)。
+
+**一个副作用改进**：`Dot` / `DotRowQuant` 原本用单个串行累加器。单串行求和的
+舍入误差随长度**线性**增长，而 BLAS 的分块/向量化求和是对数级 —— k 到 6144 时
+实测差 4–5 倍。改成 4 个独立部分和后，layer 0 的绝对误差从 `1.43e-5` 降到
+`3.81e-6`（比值 5.0 → 1.33）。4 个累加器正好对应 M5 里 SIMD 的 4 个 lane，
+所以这个结构可以直接留用。
+
+### 14.4 验证结果
+
+`python tools/check_forward.py`，3 个组合 × 每组合 29 项（embedding + 28 层
++ logits）：
+
+| 组合 | 提示词 | 序列 | 最差 p99 | argmax | 结果 |
+| --- | --- | --- | --- | --- | --- |
+| q8_ascii | `The capital of France is` | 5 | 1.47e-4 | 5/5 一致 | PASS |
+| q8_zh | 中文 ChatML（含特殊 token） | 64 | 1.38e-4 | 64/64 一致 | PASS |
+| q4_zh | 同上，换 Q4_K_M 权重 | 64 | 1.34e-4 | 64/64 一致 | PASS |
+
+其它可观察的旁证：
+
+- `The capital of France is` → top-1 ` Paris`（logit 22.92）
+- 中文 ChatML 提示词 → top-1 `<think>`（logit 30.61）—— **正是 Qwen3 默认
+  思考模式该有的行为**，说明模板与特殊 token 的正确性在引擎侧已经成立
+- 中文提示词经分词器往返**逐字节还原**
+- logits 的 `max|Δ|` 只有 `9.25e-05` —— 连原来那个绝对 1e-4 判据都过了
+  （它过只是因为 logits 这一层的量级小，不代表逐层残差流也能过）
+
+### 14.5 已知差异与限制
+
+- **fp32 精度**：内部全程 float32。误差水平见 §14.3。提高精度的路径（若需要）
+  是 Kahan 补偿求和，代价约 4 倍算力 —— 当前没有必要。
+- **`--layers N` 截断时不产出 logits**：截断模式下末端归一化与 lm_head 依赖更深的
+  层，返回空 logits 而不是一个"看起来能用"的错值。
+- **单线程 attention**：GEMM 按输出行并行，attention 走标量。这是刻意的 ——
+  并行会改浮点累加顺序，M1 阶段的首要目标是可对拍。
+- **prefill 性能还很差**：Q8_0 上 64 token 用 9.2 s（约 7 tok/s），
+  离 §9 的 100 tok/s 目标差一个数量级。这是纯标量 `DotRowQuant`
+  （每元素一次反量化）的必然结果，M5 用 SIMD + 融合反量化点积解决。
+
+### 14.6 下一步（M2）
+
+1. KV Cache。布局按 GQA：`[n_layers, n_kv_heads, max_seq, head_dim]`，
+   K 与 V 分开两块连续内存。`ForwardLayer` 里的 `CausalAttention` 换成
+   增量版本（只算当前 token 对历史 + 自己的注意力），其余算子原样复用。
+2. 采样：贪心 + top-p + 温度。**骰子/随机数的唯一来源留在宿主侧**（对齐
+   RPGBar 的"骰子只有一个来源"原则），引擎只接受一个 seed 或一个外部采样器。
+3. 判据：贪心解码 N 个 token 与官方逐 token 一致（比 logits 对拍更硬 ——
+   它要求每一步的 argmax 都对，误差会在解码过程中被放大检验）。

@@ -34,6 +34,10 @@ __pycache__/
 tools/*.json
 !tools/package.json
 
+# 对拍跑出来的中间数据（tokens / logits / hidden 的 npy，动辄几十 MB）
+runs/
+*.npy
+
 # 编辑器
 .vscode/
 .idea/
