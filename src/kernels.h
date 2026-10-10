@@ -37,6 +37,20 @@ inline float Dot(const float* a, const float* b, int64_t n) {
   return (s0 + s1) + (s2 + s3);
 }
 
+// 最大值的下标。并列时取**最小下标**，与 torch.argmax 一致 ——
+// 贪心解码的每一步都靠它，差一个并列规则就会让"逐 token 一致"的判据红。
+inline int32_t ArgMax(const float* x, int64_t n) {
+  int32_t best = 0;
+  float bv = x[0];
+  for (int64_t i = 1; i < n; ++i) {
+    if (x[i] > bv) {  // 严格大于 → 并列保留最靠前的那个
+      bv = x[i];
+      best = static_cast<int32_t>(i);
+    }
+  }
+  return best;
+}
+
 // RMSNorm：out = x * rsqrt(mean(x²) + eps) * w
 // Qwen3 的权重就是 w 本身（不像 Gemma 2 那样用 1+w），也没有 bias。
 inline void RmsNorm(const float* x, const float* w, int64_t n, float eps,
