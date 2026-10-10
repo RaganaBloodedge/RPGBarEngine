@@ -53,9 +53,23 @@ RPGBarEngine/
 
 ## 怎么开始
 
+有 cmake 的环境：
+
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-（骨架阶段还没有可编译目标，见 `docs/DESIGN.md` §10 里程碑。）
+本机（MSYS2，没有 cmake）：
+
+```bash
+./build.sh
+```
+
+骨架阶段的产物是 `build/rpg_engine.dll`（占位实现，除 `rpg_engine_version` 外都返回"未实现"）。
+已实测：dll 能被 Python ctypes 加载，10 个 C 函数按原始名导出，调用链通。
+
+**必须全静态链接**（`build.sh` 里的 `-static`）——否则 dll 会依赖 MSYS2 的 `libwinpthread-1.dll`，
+宿主（Unity / Python）加载时报 `Could not find module ... or one of its dependencies`。
+
+里程碑见 `docs/DESIGN.md` §10。
