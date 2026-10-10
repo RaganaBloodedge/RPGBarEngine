@@ -15,6 +15,7 @@
 
 #include "common.h"
 #include "gguf.h"
+#include "npy.h"
 #include "quant.h"
 
 namespace {
@@ -63,7 +64,8 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
                  "用法: dump_gguf <model.gguf> [--tensors] [--meta] "
-                 "[--sample <tensor> [n]]\n");
+                 "[--sample <tensor> [n]]\n"
+                 "[--dump-npy <tensor> <out.npy>]\n");
     return 2;
   }
   const std::string path = argv[1];
@@ -71,6 +73,7 @@ int main(int argc, char** argv) {
   bool show_meta = false;
   std::string sample_name;
   int sample_n = 8;
+  std::string dump_npy, dump_npy_name;
   for (int i = 2; i < argc; ++i) {
     if (std::strcmp(argv[i], "--tensors") == 0) {
       show_tensors = true;
@@ -79,6 +82,9 @@ int main(int argc, char** argv) {
     } else if (std::strcmp(argv[i], "--sample") == 0 && i + 1 < argc) {
       sample_name = argv[++i];
       if (i + 1 < argc && argv[i + 1][0] != '-') sample_n = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--dump-npy") == 0 && i + 2 < argc) {
+      dump_npy_name = argv[++i];
+      dump_npy = argv[++i];
     }
   }
 
@@ -144,6 +150,32 @@ int main(int argc, char** argv) {
         std::printf("  [%lld] %.8g\n", static_cast<long long>(i),
                     static_cast<double>(buf[static_cast<size_t>(i)]));
       }
+    }
+
+    if (!dump_npy.empty()) {
+      const rpg::GgufTensor* t = g.Find(dump_npy_name);
+      if (t == nullptr) {
+        std::fprintf(stderr, "找不到张量：%s\n", dump_npy_name.c_str());
+        return 1;
+      }
+      std::vector<float> buf(static_cast<size_t>(t->n_elements));
+      rpg::DequantizeRow(t->type, g.TensorBytes(*t), t->n_elements, buf.data());
+      // 形状按"行主 [rows, cols]"写：GGUF 的 dims[0] 是最快维，所以
+      // 内存展平顺序正好是 [dims[1], dims[0]]。gguf.quants.dequantize
+      // 也是这个朝向，两边可以直接逐位比。
+      std::vector<int64_t> dims;
+      if (t->dims.size() == 2) {
+        dims = {t->dims[1], t->dims[0]};
+      } else {
+        dims.assign(t->dims.rbegin(), t->dims.rend());
+      }
+      if (!npy::WriteF32(dump_npy, dims, buf.data(), buf.size())) {
+        std::fprintf(stderr, "写不了 %s\n", dump_npy.c_str());
+        return 1;
+      }
+      std::printf("已导出 %s（%s，%lld 元素）→ %s\n", t->name.c_str(),
+                  rpg::TypeName(t->type),
+                  static_cast<long long>(t->n_elements), dump_npy.c_str());
     }
     return 0;
   } catch (const std::exception& e) {
