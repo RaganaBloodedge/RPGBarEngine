@@ -24,6 +24,7 @@
 #include "dtypes.h"
 #include "json.h"
 #include "quant.h"
+#include "sampler.h"
 #include "tool_parser.h"
 #include "unicode.h"
 
@@ -540,6 +541,107 @@ void TestSimpleQuants() {
   CheckEq(static_cast<double>(rpg::F32ToF16(1e-30f)), 0.0, "f16 下溢 -> 0");
 }
 
+void TestSampler() {
+  std::printf("[采样]\n");
+
+  // counter-based 随机源：纯函数 + 范围。与 torch.multinomial 无法逐数对齐
+  // （RNG 不同），所以这里验的是它的**代数性质**（强度对拍在 check_sample.py）。
+  {
+    Check(rpg::CounterUniform(42, 0) == rpg::CounterUniform(42, 0),
+          "同 seed 同位置 -> 同一个 u");
+    Check(rpg::CounterUniform(42, 0) != rpg::CounterUniform(43, 0),
+          "不同 seed -> 不同 u");
+    bool in_range = true;
+    for (uint64_t i = 0; i < 256; ++i) {
+      const float u = rpg::CounterUniform(7, i);
+      if (!(u >= 0.0f && u < 1.0f)) in_range = false;
+    }
+    Check(in_range, "u 全部落在 [0,1)");
+  }
+
+  // 温度：越低越尖。同一组 logits，最大概率应随温度下降而上升。
+  {
+    std::vector<float> logits = {4.0f, 2.0f, 0.0f};
+    rpg::SampleOptions opt;
+    std::vector<float> hot, cold;
+    opt.temperature = 2.0f;
+    rpg::FilterToProbs(logits.data(), 3, opt, &hot);
+    opt.temperature = 0.5f;
+    rpg::FilterToProbs(logits.data(), 3, opt, &cold);
+    Check(cold[0] > hot[0], "温度越低，最大 token 的概率越高");
+    Check(std::fabs(hot[0] + hot[1] + hot[2] - 1.0f) < 1e-5f, "概率和为 1");
+  }
+
+  // temperature = 0：退化为 one-hot(argmax)，且不消耗随机数。
+  {
+    std::vector<float> logits = {1.0f, 9.0f, 3.0f};
+    rpg::SampleOptions opt;
+    opt.temperature = 0.0f;
+    std::vector<float> probs;
+    rpg::FilterToProbs(logits.data(), 3, opt, &probs);
+    Check(probs[1] == 1.0f && probs[0] == 0.0f && probs[2] == 0.0f,
+          "temperature=0 -> one-hot(argmax)");
+    Check(rpg::SampleToken(logits.data(), 3, opt, 0.123f) == 1,
+          "temperature=0 -> 任意 u 都取 argmax");
+  }
+
+  // top_k：只留概率最大的 k 个（严格小于第 k 大的被剔除）。
+  {
+    std::vector<float> logits = {5.0f, 4.0f, 3.0f, 2.0f, 1.0f, 0.0f};
+    rpg::SampleOptions opt;
+    opt.top_k = 2;
+    std::vector<float> probs;
+    rpg::FilterToProbs(logits.data(), 6, opt, &probs);
+    int nonzero = 0;
+    for (const float p : probs)
+      if (p > 0.0f) ++nonzero;
+    Check(nonzero == 2, "top_k=2 只留 2 个非零");
+    Check(probs[0] > 0.0f && probs[1] > 0.0f && probs[5] == 0.0f,
+          "top_k 留的是概率最大的两个");
+  }
+
+  // top_p：按累积概率从尾巴截断（用 log(p) 造一组已知概率）。
+  {
+    std::vector<float> logits = {std::log(0.5f), std::log(0.3f),
+                                 std::log(0.15f), std::log(0.05f)};
+    rpg::SampleOptions opt;
+    std::vector<float> probs;
+    opt.top_p = 0.9f;  // 阈值 1-0.9=0.1：0.05 那段被截掉
+    rpg::FilterToProbs(logits.data(), 4, opt, &probs);
+    int nonzero = 0;
+    for (const float p : probs)
+      if (p > 0.0f) ++nonzero;
+    Check(nonzero == 3 && probs[3] == 0.0f, "top_p=0.9 截掉最小的那个");
+    opt.top_p = 0.3f;  // 阈值 0.7：只剩最大的
+    rpg::FilterToProbs(logits.data(), 4, opt, &probs);
+    Check(probs[0] == 1.0f && probs[1] == 0.0f, "top_p 至少保留 1 个 token");
+  }
+
+  // 逆变换：u 落在哪个累积区间就选哪个 token。
+  {
+    std::vector<float> logits(4, 0.0f);  // 均匀 -> 每个 0.25
+    rpg::SampleOptions opt;
+    Check(rpg::SampleToken(logits.data(), 4, opt, 0.0f) == 0, "u=0 -> 第 1 个");
+    Check(rpg::SampleToken(logits.data(), 4, opt, 0.24f) == 0, "u=0.24 -> 第 1 个");
+    Check(rpg::SampleToken(logits.data(), 4, opt, 0.26f) == 1, "u=0.26 -> 第 2 个");
+    Check(rpg::SampleToken(logits.data(), 4, opt, 0.99f) == 3, "u=0.99 -> 第 4 个");
+  }
+
+  // 那条"看得懂"的回归：同一个 u，温度不同 -> 不同 token（README 的图）。
+  {
+    std::vector<float> logits = {4.0f, 2.0f, 0.0f};
+    rpg::SampleOptions opt;
+    opt.temperature = 0.5f;
+    const int32_t a = rpg::SampleToken(logits.data(), 3, opt, 0.95f);
+    opt.temperature = 1.0f;
+    const int32_t b = rpg::SampleToken(logits.data(), 3, opt, 0.95f);
+    opt.temperature = 2.0f;
+    const int32_t c = rpg::SampleToken(logits.data(), 3, opt, 0.95f);
+    Check(a == 0 && b == 1 && c == 2,
+          "同一个 u=0.95：T=0.5->0, T=1.0->1, T=2.0->2");
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -556,6 +658,7 @@ int main(int argc, char** argv) {
   TestChatTemplate();
   TestToolParser();
   TestSimpleQuants();
+  TestSampler();
 
   std::printf("\n通过 %d，失败 %d\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
