@@ -3,14 +3,14 @@
 RPGBar 的内置推理引擎。目标是把"玩家要自己配模型服务"变成"装完游戏就能选到一个模型"——
 引擎编进游戏本体，权重随包分发，进程内调用，零外部依赖、零 HTTP 往返。
 
-> 状态：**M0–M4 完成**（含 M2.5 采样），**M5 完成一半** —— AVX2 融合反量化点积已落地，
-> decode 达标（Qwen3-1.7B-Q4_K_M 实测 **22.9 tok/s**，目标 15）。prefill 还差一个
-> 数量级（35.4 / 100 tok/s），缺的是多 token 分块，见 `docs/DESIGN.md` §19.7。
+> 状态：**M0–M4 完成**（含 M2.5 采样），**M5 完成** —— AVX2 融合反量化点积 + 多 token
+> 阻塞乘双双落地。decode **22.9 tok/s**（目标 15，达标）、prefill **85–91 tok/s**
+> （目标 100，接近），见 `docs/DESIGN.md` §19。
 > C ABI 已落地，宿主能真的加载权重、建会话、生成、释放；采样能按宿主给的
 > `temperature` 调节创造性。
 > 已完成：GGUF 解析 / 15 种 ggml 量化类型反量化 / Qwen BBPE 分词器 /
 > 全序列前向 / KV Cache / 生成（贪心 + 温度采样）/ ChatML 模板 / tool_call 解析 /
-> C ABI / **AVX2 融合点积内核（Q4_K / Q6_K / Q8_0 / F32，带标量兜底）**。
+> C ABI / **AVX2 融合点积 + 多 token 阻塞乘内核（Q4_K / Q6_K / Q8_0 / F32，带标量兜底）**。
 >
 > 许可证 MIT。进度与设计依据见 `docs/DESIGN.md`：M0 见 §13，M1 见 §14，M2 见 §15，
 > M3 见 §16，M4 见 §17，M2.5 见 §18，M5 见 §19。**引擎里没有有状态的 RNG** —— 随机性来自宿主
@@ -85,7 +85,8 @@ MSYS2 环境（没有 cmake 时）：
 
 产物：`build/rpg_engine.dll`、`build/dump_gguf.exe`、`build/tok_check.exe`、
 `build/selftest.exe`、`build/forward_check.exe`、`build/gen_check.exe`、
-`build/chatml_check.exe`、`build/parse_check.exe`。
+`build/chatml_check.exe`、`build/parse_check.exe`、`build/sample_check.exe`、
+`build/dotrow_check.exe`、`build/prefill_prof.exe`。
 
 两个构建坑（改构建脚本时别丢）：
 
@@ -116,7 +117,7 @@ bash tools/run_checks.sh
 
 | 层 | 手段 | 当前结果 |
 | --- | --- | --- |
-| 1 进程内自检 | `selftest.exe` | 133/133 |
+| 1 进程内自检 | `selftest.exe` | 150/150（含阻塞乘 vs 逐 token、串并行逐位相同） |
 | 2 量化块尺寸 | `check_quant_layout.py` 用 GGUF 写入器的 offset 反推 | 全部一致，张量无缝铺满 |
 | 3 量化语义（逐位） | `xcheck_dequant.py` vs `gguf.quants`（llama.cpp 官方算法） | **逐位相同**（含 3.1 亿元素的整张词表） |
 | 4 分词器 | `tok_ref.py` 对 HF `tokenizers` | 3031/3031 逐 id 一致 |
@@ -127,6 +128,10 @@ bash tools/run_checks.sh
 | 9 C ABI（M4） | `check_abi.py` 用 ctypes 走 `rpg_engine.dll`（宿主视角） | 35/35：导出表、句柄生命周期、与工具链结果一致、前缀复用逐位等价、响应形状 |
 | 10 采样（M2.5） | `check_sample.py` vs HF 的 Temperature/TopK/TopP warpers | 108 组筛选**逐元素**一致；随机源纯函数且均匀 |
 | 11 融合点积（M5） | `check_dotrow.py`：AVX2 内核 vs 标量 vs float64 | 3 类型全过，`max\|Δ\|/Σ\|a·w\|` 2.5e-8~4.9e-8（判据 1e-6） |
+
+另有 `build/prefill_prof.exe`（不在分层表里）：把 prefill 的**算力上限、顺序读带宽、
+线程扩展、matmul 占比**一次量出来。它不判定对错，只给数 —— M5 后半的归因全靠它，
+用法见 `docs/DESIGN.md` §19.7。
 
 第 9 层不需要 `torch`，所以它在前 8 层跑不起来的机器上照样能跑；第 10 层需要
 `torch` / `transformers` 但**不需要权重**；第 11 层需要权重和 `numpy`，
@@ -159,6 +164,7 @@ python tools/check_toolcall.py                      # M3 端到端（工具调�
 python tools/check_abi.py                           # M4 第 9 层（宿主视角，走 dll）
 python tools/check_sample.py                        # M2.5 第 10 层（采样器，不需权重）
 python tools/check_dotrow.py                        # M5 第 11 层（AVX2 内核，需权重+numpy）
+./build/prefill_prof.exe models/Qwen3-1.7B-Q4_K_M.gguf        # M5 性能归因（上限/带宽/线程扩展）
 ./build/sample_check.exe --logits L.bin --temperature 0.8 --out-probs P.bin  # 看筛选后的分布
 ./build/sample_check.exe --rng --seed 42 --counter 0 --count 5               # 看 counter-based 随机数
 ./build/sample_check.exe --logits L.bin --temperature 2.0 --u 0.95           # 同一个 u，看落点
@@ -310,13 +316,16 @@ JSON 输出），调高则分布变平、更容易选到低概率的表达（更
   不传 `temperature` 的老请求行为与 M4 逐位一致。要采样就传一个正的温度（上限
   2.0，超出会被钳制并打一条警告）。`top_k` / `top_p` 目前宿主调不了，由引擎固定
   （0.95 / 关闭）。
-- **prefill 还慢**：Qwen3-1.7B-Q4_K_M 实测 64 token **1.81 s（35.4 tok/s）**，
-  离目标 100 tok/s 差一档。原因不是内核慢，而是**权重被每个 token 各读一遍**
-  （未做多 token 分块）—— 修法与实测排除过的一条错路见 `docs/DESIGN.md` §19.7。
+- **prefill 接近达标**：Qwen3-1.7B-Q4_K_M 实测 64 token **0.73–0.75 s（85–91 tok/s）**，
+  目标 100。两处提速叠起来是 **11.7×**（7.5 → 85–91 tok/s），归因过程见
+  `docs/DESIGN.md` §19.7 —— 关键是先用 `tools/prefill_prof` 量，而不是猜。
 - **decode 已达标**：同一份权重实测 **22.9 tok/s**（M5 前是 6.3），超过 15 tok/s 目标。
   AVX2 内核与标量路径数值等价（相对 ~3e-8），且端到端仍与 PyTorch 逐 token 一致。
 - **top_p 用的是全量排序**：vocab 151936，每个采样 token 多花几毫秒。只在
   `temperature > 0` 时走到（贪心不经过它）。改成 partial sort 是独立小改。
+- **多 token 阻塞乘按 `MR=1`（8 token × 1 行）分块**：权重流量降到 1/8，但激活流量
+  仍是"每行重扫一遍"。16 线程的扩展比因此从 11× 掉到 5.3× —— **瓶颈换成了搬激活**。
+  提高 `MR` 要牺牲 `NR`（AVX2 只有 16 个寄存器），收益互相抵消，留作后续可选优化。
 - **只实现 Qwen3 一个模板**：不做通用模板引擎（不引 Jinja），换模型族要加一个
   渲染函数。这是刻意的取舍，见 `docs/DESIGN.md` §6。
 - **不做 NFC 归一化**：跟随 llama.cpp 的行为（Qwen3 的 tokenizer.json 声明了 NFC，

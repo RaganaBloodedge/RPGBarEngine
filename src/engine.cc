@@ -38,7 +38,7 @@
 namespace {
 
 // 引擎版本。与 CMakeLists.txt 的 project(VERSION) 保持一致。
-constexpr const char* kEngineVersion = "0.3.0";
+constexpr const char* kEngineVersion = "0.4.0";
 
 // 请求/会话配置里没给 max_tokens 时的默认值。
 constexpr int32_t kDefaultMaxTokens = 256;
