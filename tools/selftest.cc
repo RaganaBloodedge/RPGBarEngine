@@ -771,6 +771,108 @@ void TestMatmulKernels() {
   }
 }
 
+// M5 后半：多 token 阻塞内核必须与**逐 token 逐行点积**给出同一个数。
+//
+// 阻塞内核把一次权重读摊到 8 个 token 上，累加顺序因此与逐 token 不同 —— 所以
+// 它不能只靠"和标量比"来验（两条路都变了），要比的是同一类型的**两条路径**：
+//   * MatMulBlocked        —— 8 个 token 共用一次权重读（新）
+//   * 逐 token DotRowQuant —— 参考路径（旧）
+// 顺带覆盖两个尾巴：rows 为奇数（行不成对）、n_tokens 不是 8 的倍数；以及
+// 串行（pool = nullptr）与并行两路必须**逐位相同**（并行只切行，不该改结果）。
+void TestMatmulBlocked() {
+  std::printf("[多 token 阻塞内核]\n");
+
+  const char* kn = rpg::ActiveKernelName();
+  const bool avx2 = std::strcmp(kn, "avx2") == 0;
+  bool ok = true;
+  const uint32_t types[] = {rpg::kGgmlF32, rpg::kGgmlQ4_K, rpg::kGgmlQ6_K,
+                            rpg::kGgmlQ8_0};
+  for (uint32_t t : types) {
+    if (rpg::HasBlockedKernel(t) != avx2) ok = false;
+  }
+  Check(ok, "HasBlockedKernel 与实际生效的内核一致");
+  Check(!rpg::HasBlockedKernel(rpg::kGgmlQ5_0), "没写阻塞内核的类型报告 false");
+
+  struct Case {
+    uint32_t type;
+    int64_t cols;
+    int64_t rows;
+    int64_t n;
+    const char* name;
+  };
+  const Case cases[] = {
+      {rpg::kGgmlQ4_K, 512, 5, 11, "Q4_K"},  // 奇数行 + token 尾巴 3
+      {rpg::kGgmlQ4_K, 256, 6, 16, "Q4_K"},  // 整两组
+      {rpg::kGgmlQ6_K, 512, 3, 9, "Q6_K"},
+      {rpg::kGgmlQ8_0, 256, 4, 13, "Q8_0"},
+      {rpg::kGgmlF32, 264, 3, 9, "F32"},
+  };
+
+  rpg::ThreadPool pool(4);
+  for (const Case& c : cases) {
+    uint64_t seed = 0x9E3779B9ull + c.type * 977u +
+                    static_cast<uint64_t>(c.cols) * 31u;
+    const int64_t row_bytes = rpg::TypeRowBytes(c.type, c.cols);
+
+    // 每一行独立造一份"结构合法"的权重（行之间互不相同，才能验出行号没串）。
+    std::vector<uint8_t> w(static_cast<size_t>(row_bytes * c.rows));
+    for (int64_t r = 0; r < c.rows; ++r) {
+      std::vector<uint8_t> one;
+      KxMakeWeights(c.type, c.cols, seed, one);
+      std::memcpy(w.data() + r * row_bytes, one.data(), one.size());
+    }
+
+    std::vector<float> X(static_cast<size_t>(c.n * c.cols));
+    for (float& v : X) {
+      v = (static_cast<float>(KxMix(seed) >> 40) / 16777216.0f - 0.5f) * 8.0f;
+    }
+
+    std::vector<float> out_ser(static_cast<size_t>(c.n * c.rows), 0.0f);
+    std::vector<float> out_par(static_cast<size_t>(c.n * c.rows), 0.0f);
+    const bool took = rpg::MatMulBlocked(c.type, w.data(), c.rows, c.cols,
+                                         X.data(), c.n, out_ser.data(), nullptr);
+    rpg::MatMulBlocked(c.type, w.data(), c.rows, c.cols, X.data(), c.n,
+                       out_par.data(), &pool);
+    Check(took == avx2, "MatMulBlocked 的接管与否与内核一致");
+
+    // 参考：逐 token 逐行 DotRowQuant（就是 MatMulBatch 原来的写法）。
+    std::vector<float> wf(static_cast<size_t>(c.cols));
+    double worst = 0.0;
+    bool par_identical = true;
+    for (int64_t r = 0; r < c.rows; ++r) {
+      rpg::DequantizeRow(c.type, w.data() + r * row_bytes, c.cols, wf.data());
+      for (int64_t t = 0; t < c.n; ++t) {
+        const float* a = X.data() + t * c.cols;
+        const float ref =
+            rpg::DotRowQuant(c.type, a, w.data() + r * row_bytes, c.cols);
+        double scale = 0.0;
+        for (int64_t i = 0; i < c.cols; ++i) {
+          scale += std::fabs(static_cast<double>(a[i]) *
+                             static_cast<double>(wf[static_cast<size_t>(i)]));
+        }
+        const size_t idx = static_cast<size_t>(t * c.rows + r);
+        const double err =
+            std::fabs(static_cast<double>(out_ser[idx]) -
+                      static_cast<double>(ref)) /
+            (scale > 0.0 ? scale : 1.0);
+        if (err > worst) worst = err;
+        if (out_ser[idx] != out_par[idx]) par_identical = false;
+      }
+    }
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+                  "%s cols=%lld rows=%lld n=%lld 阻塞 vs 逐 token 一致"
+                  "（相对 %.1e）",
+                  c.name, static_cast<long long>(c.cols),
+                  static_cast<long long>(c.rows),
+                  static_cast<long long>(c.n), worst);
+    Check(worst < 1e-5, buf);
+    char buf2[160];
+    std::snprintf(buf2, sizeof(buf2), "%s 串行与并行结果逐位相同", c.name);
+    Check(par_identical, buf2);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -789,6 +891,7 @@ int main(int argc, char** argv) {
   TestSimpleQuants();
   TestSampler();
   TestMatmulKernels();
+  TestMatmulBlocked();
 
   std::printf("\n通过 %d，失败 %d\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
