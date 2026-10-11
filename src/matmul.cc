@@ -19,6 +19,7 @@ namespace rpg {
 namespace {
 
 using kernels::DotRowFn;
+using kernels::MatMulBlockedFn;
 
 // CPU 是否支持 AVX2 + FMA。
 //
@@ -53,6 +54,17 @@ DotRowFn SelectKernel() {
 }
 
 const DotRowFn g_dot_row = SelectKernel();
+
+// 阻塞内核同样在静态初始化期选一次。**与 g_dot_row 独立**：DISABLE 环境变量
+// 只关 SIMD 点积时，阻塞乘也该一起关掉（两者都在 AVX2 TU 里），否则"对照基准"
+// 量到的不是同一件事。
+MatMulBlockedFn SelectBlocked() {
+  if (SimdDisabledByEnv()) return nullptr;
+  if (!CpuHasAvx2()) return nullptr;
+  return kernels::Avx2MatMulBlocked();
+}
+
+const MatMulBlockedFn g_matmul_blocked = SelectBlocked();
 
 }  // namespace
 
@@ -102,6 +114,18 @@ const char* ActiveKernelName() {
 bool HasSimdKernel(uint32_t type) {
   if (g_dot_row == &DotRowQuantRef) return false;
   return kernels::Avx2SupportsType(type);
+}
+
+bool MatMulBlocked(uint32_t type, const uint8_t* w, int64_t rows, int64_t cols,
+                   const float* X, int64_t n_tokens, float* OUT,
+                   ThreadPool* pool) {
+  if (g_matmul_blocked == nullptr) return false;
+  return g_matmul_blocked(type, w, rows, cols, X, n_tokens, OUT, pool);
+}
+
+bool HasBlockedKernel(uint32_t type) {
+  if (g_matmul_blocked == nullptr) return false;
+  return kernels::Avx2SupportsBlockedType(type);
 }
 
 }  // namespace rpg

@@ -9,6 +9,8 @@
 
 #include <cstdint>
 
+#include "threads.h"
+
 namespace rpg {
 namespace kernels {
 
@@ -25,6 +27,16 @@ DotRowFn Avx2DotRow();
 // 该类型是否真有 SIMD 内核（不是退回标量）。定义在 matmul_avx2.cc；
 // 未编入 AVX2 时恒为 false。
 bool Avx2SupportsType(uint32_t type);
+
+// 多 token 阻塞乘的内核入口（见 matmul.h 的说明）。
+using MatMulBlockedFn = bool (*)(uint32_t, const uint8_t*, int64_t, int64_t,
+                                 const float*, int64_t, float*, ThreadPool*);
+
+// 定义在 matmul_avx2.cc；未编入 AVX2 时返回 nullptr。
+MatMulBlockedFn Avx2MatMulBlocked();
+
+// 该类型是否有阻塞内核。未编入 AVX2 时恒为 false。
+bool Avx2SupportsBlockedType(uint32_t type);
 
 }  // namespace kernels
 }  // namespace rpg

@@ -64,9 +64,11 @@ constexpr int64_t kMaxBlockElems = 256;
 // 前置：TypeSupported(id)、n_elems % block_elems == 0。
 void DequantizeRow(uint32_t id, const uint8_t* src, int64_t n_elems, float* dst);
 
-// Q4_K / Q5_K 的 6-bit scale/min 拆包（ggml 的 get_scale_min_k4 同款）。
-// 给 SIMD 内核复用：每 256 元素块只调 8 次，不值得再写一份 SIMD 版。
-void GetScaleMinK4Bytes(int j, const uint8_t* q, uint8_t* d, uint8_t* m);
+// 注意：Q4_K / Q5_K 的 6-bit 拆包（ggml get_scale_min_k4 同款）**不对外导出**。
+// 它只在本文件内部（DeqQ4_K / DeqQ5_K）和 SIMD 内核里就地 inline 使用。
+// 曾经这里导出过一个 GetScaleMinK4Bytes 供 matmul_avx2.cc 复用，实测那是热循环里
+// 一次**跨编译单元的真实函数调用**，把内核压到峰值的 7%（详见 DESIGN §19.7）。
+// 别再往外开一个这样的门 —— 热循环里没有"调用次数少所以无所谓"的函数。
 
 }  // namespace rpg
 

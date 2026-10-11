@@ -368,14 +368,6 @@ void DeqQ8_K(const uint8_t* src, int64_t n, float* dst) {
 
 }  // namespace
 
-// 6-bit scale/min 拆包。Q4_K / Q5_K 用（即 ggml 的 get_scale_min_k4）。
-// 实现留在匿名命名空间里，这里只开一个对外的门 —— SIMD 内核（matmul_avx2.cc）
-// 要复用它：每块只跑 8 次，相对 256 个元素的 FMA 完全不是瓶颈，没必要为了省
-// 这点开销再写一份容易错的 SIMD 拆包（错了不崩、只静默算错）。
-void GetScaleMinK4Bytes(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
-  GetScaleMinK4(j, q, d, m);
-}
-
 const GgmlTypeInfo* TypeInfo(uint32_t id) {
   for (const auto& t : kTypes) {
     if (t.id == id) return &t;

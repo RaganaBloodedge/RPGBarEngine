@@ -24,6 +24,8 @@
 
 #include <cstdint>
 
+#include "threads.h"
+
 namespace rpg {
 
 // 点积：a[0..k) 与「ggml 量化类型 `type` 的一行权重」（w 指向该行起始字节）。
@@ -34,6 +36,26 @@ float DotRowQuant(uint32_t type, const float* a, const uint8_t* w, int64_t k);
 
 // 标量参考实现。**不参与分派**，只给兜底与对拍用。
 float DotRowQuantRef(uint32_t type, const float* a, const uint8_t* w, int64_t k);
+
+// 多 token 阻塞乘（M5 的后半）。
+//
+//   OUT[t * rows + r] = dot(X[t], W 的第 r 行)，t ∈ [0, n_tokens)，r ∈ [0, rows)
+//
+// 与"逐 token 调 DotRowQuant"的区别只有一条，但它是 prefill 慢的全部原因：
+//
+//   逐 token 的写法里，**每个 token 都要把整份权重重新扫一遍**。64 个 token 的
+//   prefill 就是 64 倍权重流量 —— 实测把 16 线程死死按在内存带宽上（权重等效
+//   46.5 GB/s，而本机顺序读上限约 50 GB/s）。所以瓶颈不在算力在搬运，见
+//   tools/prefill_prof.cc。阻塞版把一次权重读摊到 8 个 token 上，流量直接降 8 倍。
+//
+// 返回 false = 该类型 / 该 CPU 没有阻塞内核，调用方回退逐 token 路径
+// （这是正常降级，不是错误）。
+bool MatMulBlocked(uint32_t type, const uint8_t* w, int64_t rows, int64_t cols,
+                   const float* X, int64_t n_tokens, float* OUT,
+                   ThreadPool* pool);
+
+// 该类型是否有阻塞内核。
+bool HasBlockedKernel(uint32_t type);
 
 // 当前实际生效的内核名："avx2" 或 "scalar"。给探针与日志用。
 const char* ActiveKernelName();

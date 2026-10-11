@@ -41,6 +41,14 @@ void QuantMatrix::MatMulBatch(const float* X, int64_t n_tokens, float* OUT,
   RPG_CHECK(valid(), "对无效矩阵做 MatMulBatch");
   const int64_t row_bytes = TypeRowBytes(type_, cols_);
 
+  // 多 token 优先走阻塞内核：一次权重读服务 8 个 token（M5 后半）。
+  // 逐 token 的写法每 token 重扫一遍权重 —— 那是 prefill 的瓶颈所在（M5 实测
+  // 16 线程被按在内存带宽上），不是算力。token 少于 8 个时它内部会拒收。
+  if (n_tokens >= 8 && MatMulBlocked(type_, data_, rows_, cols_, X, n_tokens, OUT,
+                                     pool)) {
+    return;
+  }
+
   // 展平成 n_tokens * rows 个独立的点积：第 i 个 = (t = i / rows, r = i % rows)。
   // 这样切分天然按行连续，且同一 token 的输出写在一起。
   auto body = [&](int64_t begin, int64_t end) {

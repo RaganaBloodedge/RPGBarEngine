@@ -62,6 +62,25 @@ inline __m256 I8x8ToF32(__m128i x) {
 // 8 个 uint8 → 8 个 int32（零扩展）
 inline __m256i U8x8ToI32(__m128i x) { return _mm256_cvtepu8_epi32(x); }
 
+// Q4_K 的 6-bit (scale, min) 拆包 —— **就地内联版**。
+//
+// 这条注释是实测逼出来的：原实现调 quant.cc 的 GetScaleMinK4Bytes，理由是
+// "每块只跑 8 次、不是瓶颈"。错在**它是跨编译单元的真实函数调用**（没有 LTO），
+// 每次 ~15 周期的调用/返回开销 × 每块 8 次 × 每 token 每块一次 —— 单核实测
+// 只有 5.5 GMAC/s，恰好是 FMA 峰值（74.7）的 7%：内核被**调用开销**压死了，
+// 不是在算。挪成 inline 后同一段代码吞吐提升数倍（见 tools/prefill_prof.cc）。
+//
+// 教训：热循环里没有"调用次数少、所以无所谓"的函数 —— 只有"内联"和"不内联"。
+inline void ScaleMinK4Inline(int j, const uint8_t* q, uint8_t* sc, uint8_t* mn) {
+  if (j < 4) {
+    *sc = static_cast<uint8_t>(q[j] & 63);
+    *mn = static_cast<uint8_t>(q[j + 4] & 63);
+  } else {
+    *sc = static_cast<uint8_t>((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4));
+    *mn = static_cast<uint8_t>((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+  }
+}
+
 // 融合反量化的一步：acc += a * (d*nib - mn)。
 // 权重值 v = d*nib - mn 在寄存器里现算，不做内存往返。
 inline __m256 FmaDeq(__m256 acc, const float* a, __m256 nib, __m256 d,
@@ -135,9 +154,9 @@ float DotQ8_0Avx2(const float* a, const uint8_t* w, int64_t k) {
 // 256 个元素分 4 组、每组 64：组内低半字节 → 前 32 个（scale/min = 第 2i 个），
 // 高半字节 → 后 32 个（第 2i+1 个）。值 = d*sc*nib - dmin*mn。
 //
-// 6-bit 拆包直接调 quant.cc 里那份**标量** GetScaleMinK4Bytes —— 它每块只跑 8
-// 次，相对 256 个元素的 FMA 完全不是瓶颈，没必要为了省这点开销再写一份容易错
-// 的 SIMD 拆包（错了不崩、只静默算错）。
+// 6-bit 拆包用**本文件内**的 ScaleMinK4Inline（见文件开头那条注释）：写成跨 TU
+// 的调用会把内核压到峰值的 7%。这里没必要再写一份 SIMD 拆包 —— 每块只跑 8 次，
+// 相对 256 个元素的 FMA 不是瓶颈，而写错的代价是静默算错。
 float DotQ4_KAvx2(const float* a, const uint8_t* w, int64_t k) {
   const int64_t nb = k / 256;
   __m256 o0 = _mm256_setzero_ps(), o1 = _mm256_setzero_ps();
@@ -152,8 +171,8 @@ float DotQ4_KAvx2(const float* a, const uint8_t* w, int64_t k) {
     const float* ap = a + b * 256;
     for (int g = 0; g < 4; ++g) {
       uint8_t sc0, mn0, sc1, mn1;
-      GetScaleMinK4Bytes(2 * g + 0, scales, &sc0, &mn0);
-      GetScaleMinK4Bytes(2 * g + 1, scales, &sc1, &mn1);
+      ScaleMinK4Inline(2 * g + 0, scales, &sc0, &mn0);
+      ScaleMinK4Inline(2 * g + 1, scales, &sc1, &mn1);
       const __m256 d0 = _mm256_set1_ps(d * static_cast<float>(sc0));
       const __m256 n0 = _mm256_set1_ps(dmin * static_cast<float>(mn0));
       const __m256 d1 = _mm256_set1_ps(d * static_cast<float>(sc1));
@@ -269,6 +288,224 @@ float DotQ6_KAvx2(const float* a, const uint8_t* w, int64_t k) {
                               _mm256_add_ps(o2, o3)));
 }
 
+// ---- 多 token 阻塞内核（M5 后半）-------------------------------------------
+//
+// 前向声明：尾巴（不满 8 个 token）要退回逐 token 内核，而它在文件后面。
+float DotRowAvx2(uint32_t type, const float* a, const uint8_t* w, int64_t k);
+//
+// 一个权重向量（8 个元素）同时乘到 8 个 token 上：
+//
+//   acc[t] += x[t][k..k+8) * wv        t = 0..7
+//
+// 这就是全部要点。逐 token 的写法里 wv 被解出来只用一次就丢；这里解一次用 8 次，
+// 权重流量降到 1/8 —— 而 prefill 恰恰是被权重流量按住的（见 tools/prefill_prof.cc：
+// 16 线程等效 46.5 GB/s，本机顺序读上限约 50 GB/s）。
+//
+// 寄存器预算：8 个累加器 + 1 个权重向量 + 1 个加载临时 = 10，远低于 16 的硬顶。
+// 每步 1 次解包 + 8 次加载 + 8 次 FMA —— 加载/FMA = 1.0，两个端口同时打满。
+//
+// xbase 指向**第一个 token 那一行**的起始（X + t0 * cols），相邻 token 相距 ld
+// 个 float（= cols）。off 是这一组 8 个元素在行内的下标。
+#define ACC8_FMA(WV, OFF)                                         \
+  do {                                                            \
+    const float* bp = xbase + (OFF);                              \
+    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(bp + 0 * ld), (WV), acc0); \
+    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(bp + 1 * ld), (WV), acc1); \
+    acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(bp + 2 * ld), (WV), acc2); \
+    acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(bp + 3 * ld), (WV), acc3); \
+    acc4 = _mm256_fmadd_ps(_mm256_loadu_ps(bp + 4 * ld), (WV), acc4); \
+    acc5 = _mm256_fmadd_ps(_mm256_loadu_ps(bp + 5 * ld), (WV), acc5); \
+    acc6 = _mm256_fmadd_ps(_mm256_loadu_ps(bp + 6 * ld), (WV), acc6); \
+    acc7 = _mm256_fmadd_ps(_mm256_loadu_ps(bp + 7 * ld), (WV), acc7); \
+  } while (0)
+
+#define ACC8_STORE()                        \
+  do {                                      \
+    out[0 * stride] = HSum256(acc0);        \
+    out[1 * stride] = HSum256(acc1);        \
+    out[2 * stride] = HSum256(acc2);        \
+    out[3 * stride] = HSum256(acc3);        \
+    out[4 * stride] = HSum256(acc4);        \
+    out[5 * stride] = HSum256(acc5);        \
+    out[6 * stride] = HSum256(acc6);        \
+    out[7 * stride] = HSum256(acc7);        \
+  } while (0)
+
+// 8 个 token 对**一行** Q4_K 权重求点积。out[t * stride] 是第 t 个 token 的结果。
+void RowDot8Q4K(const uint8_t* w, int64_t cols, const float* xbase, float* out,
+                int64_t ld, int64_t stride) {
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+  __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+  __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+  const __m256i m4 = _mm256_set1_epi8(0x0F);
+  const int64_t nb = cols / 256;
+  for (int64_t b = 0; b < nb; ++b) {
+    const uint8_t* p = w + b * 144;
+    const float d = F16ToF32(LoadU16(p + 0));
+    const float dmin = F16ToF32(LoadU16(p + 2));
+    const uint8_t* scales = p + 4;
+    const uint8_t* qs = p + 16;
+    for (int g = 0; g < 4; ++g) {
+      uint8_t sc0, mn0, sc1, mn1;
+      ScaleMinK4Inline(2 * g + 0, scales, &sc0, &mn0);
+      ScaleMinK4Inline(2 * g + 1, scales, &sc1, &mn1);
+      const __m256 d0 = _mm256_set1_ps(d * static_cast<float>(sc0));
+      const __m256 n0 = _mm256_set1_ps(dmin * static_cast<float>(mn0));
+      const __m256 d1 = _mm256_set1_ps(d * static_cast<float>(sc1));
+      const __m256 n1 = _mm256_set1_ps(dmin * static_cast<float>(mn1));
+
+      const __m256i q = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(qs + 32 * g));
+      const __m256i lo = _mm256_and_si256(q, m4);
+      const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4);
+      const __m128i lo0 = _mm256_castsi256_si128(lo);
+      const __m128i lo1 = _mm256_extracti128_si256(lo, 1);
+      const __m128i hi0 = _mm256_castsi256_si128(hi);
+      const __m128i hi1 = _mm256_extracti128_si256(hi, 1);
+
+      const int64_t base = b * 256 + 64 * g;
+      ACC8_FMA(_mm256_fmsub_ps(d0, U8x8ToF32(lo0), n0), base + 0);
+      ACC8_FMA(_mm256_fmsub_ps(d0, U8x8ToF32(_mm_srli_si128(lo0, 8)), n0),
+               base + 8);
+      ACC8_FMA(_mm256_fmsub_ps(d0, U8x8ToF32(lo1), n0), base + 16);
+      ACC8_FMA(_mm256_fmsub_ps(d0, U8x8ToF32(_mm_srli_si128(lo1, 8)), n0),
+               base + 24);
+      ACC8_FMA(_mm256_fmsub_ps(d1, U8x8ToF32(hi0), n1), base + 32);
+      ACC8_FMA(_mm256_fmsub_ps(d1, U8x8ToF32(_mm_srli_si128(hi0, 8)), n1),
+               base + 40);
+      ACC8_FMA(_mm256_fmsub_ps(d1, U8x8ToF32(hi1), n1), base + 48);
+      ACC8_FMA(_mm256_fmsub_ps(d1, U8x8ToF32(_mm_srli_si128(hi1, 8)), n1),
+               base + 56);
+    }
+  }
+  ACC8_STORE();
+}
+
+// 8 个 token 对一行 Q6_K 权重。
+void RowDot8Q6K(const uint8_t* w, int64_t cols, const float* xbase, float* out,
+                int64_t ld, int64_t stride) {
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+  __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+  __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+  const int64_t nb = cols / 256;
+  for (int64_t b = 0; b < nb; ++b) {
+    const uint8_t* p = w + b * 210;
+    const uint8_t* ql = p;
+    const uint8_t* qh = p + 128;
+    const int8_t* sc = reinterpret_cast<const int8_t*>(p + 192);
+    const float d = F16ToF32(LoadU16(p + 208));
+    for (int half = 0; half < 2; ++half) {
+      const uint8_t* qlh = ql + half * 64;
+      const uint8_t* qhh = qh + half * 32;
+      const int8_t* sch = sc + half * 8;
+      for (int l0 = 0; l0 < 32; l0 += 8) {
+        const __m128i qlb =
+            _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qlh + l0));
+        const __m128i qlb2 =
+            _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qlh + l0 + 32));
+        const __m128i qhb =
+            _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qhh + l0));
+        __m256 q1, q2, q3, q4;
+        Q6Unpack8(qlb, qlb2, qhb, &q1, &q2, &q3, &q4);
+        const int si = l0 >> 4;
+        const __m256 s1 = _mm256_set1_ps(d * static_cast<float>(sch[si + 0]));
+        const __m256 s2 = _mm256_set1_ps(d * static_cast<float>(sch[si + 2]));
+        const __m256 s3 = _mm256_set1_ps(d * static_cast<float>(sch[si + 4]));
+        const __m256 s4 = _mm256_set1_ps(d * static_cast<float>(sch[si + 6]));
+        const int64_t base = b * 256 + half * 128 + l0;
+        ACC8_FMA(_mm256_mul_ps(s1, q1), base + 0);
+        ACC8_FMA(_mm256_mul_ps(s2, q2), base + 32);
+        ACC8_FMA(_mm256_mul_ps(s3, q3), base + 64);
+        ACC8_FMA(_mm256_mul_ps(s4, q4), base + 96);
+      }
+    }
+  }
+  ACC8_STORE();
+}
+
+// 8 个 token 对一行 Q8_0 权重。
+void RowDot8Q8_0(const uint8_t* w, int64_t cols, const float* xbase, float* out,
+                 int64_t ld, int64_t stride) {
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+  __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+  __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+  const int64_t nb = cols / 32;
+  for (int64_t b = 0; b < nb; ++b) {
+    const uint8_t* p = w + b * 34;
+    const __m256 d = _mm256_set1_ps(F16ToF32(LoadU16(p)));
+    const int8_t* q = reinterpret_cast<const int8_t*>(p + 2);
+    for (int i = 0; i < 4; ++i) {
+      const __m256 wv = _mm256_mul_ps(
+          d, I8x8ToF32(_mm_loadl_epi64(
+                 reinterpret_cast<const __m128i*>(q + 8 * i))));
+      ACC8_FMA(wv, b * 32 + 8 * i);
+    }
+  }
+  ACC8_STORE();
+}
+
+// 8 个 token 对一行 F32 权重。
+void RowDot8F32(const uint8_t* w, int64_t cols, const float* xbase, float* out,
+                int64_t ld, int64_t stride) {
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+  __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+  __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+  const float* wp = reinterpret_cast<const float*>(w);
+  const int64_t nb = cols / 8;
+  for (int64_t i = 0; i < nb; ++i) {
+    ACC8_FMA(_mm256_loadu_ps(wp + 8 * i), 8 * i);
+  }
+  ACC8_STORE();
+}
+
+#undef ACC8_FMA
+#undef ACC8_STORE
+
+// 按类型选一行内核。
+void RowDot8(uint32_t type, const uint8_t* w, int64_t cols, const float* xbase,
+             float* out, int64_t ld, int64_t stride) {
+  switch (type) {
+    case kGgmlQ4_K: RowDot8Q4K(w, cols, xbase, out, ld, stride); return;
+    case kGgmlQ6_K: RowDot8Q6K(w, cols, xbase, out, ld, stride); return;
+    case kGgmlQ8_0: RowDot8Q8_0(w, cols, xbase, out, ld, stride); return;
+    case kGgmlF32: RowDot8F32(w, cols, xbase, out, ld, stride); return;
+    default: RPG_CHECK(false, "类型 %u 没有阻塞内核", type);
+  }
+}
+
+// 阻塞乘入口：按**行**并行（行之间互不依赖），每行一次权重读服务 8 个 token。
+// 不足 8 个 token 的尾巴退回逐 token 路径 —— 一行末尾至多 7 个，无所谓。
+bool MatMulBlockedAvx2(uint32_t type, const uint8_t* w, int64_t rows,
+                       int64_t cols, const float* X, int64_t n_tokens, float* OUT,
+                       ThreadPool* pool) {
+  if (!Avx2SupportsBlockedType(type)) return false;
+  if (n_tokens < 8) return false;  // 凑不满一组，逐 token 更省事
+  const int64_t row_bytes = TypeRowBytes(type, cols);
+
+  auto body = [&](int64_t rb, int64_t re) {
+    for (int64_t r = rb; r < re; ++r) {
+      const uint8_t* wr = w + r * row_bytes;
+      int64_t t = 0;
+      for (; t + 8 <= n_tokens; t += 8) {
+        RowDot8(type, wr, cols, X + t * cols, OUT + t * rows + r, cols, rows);
+      }
+      for (; t < n_tokens; ++t) {
+        OUT[t * rows + r] = DotRowAvx2(type, X + t * cols, wr, cols);
+      }
+    }
+  };
+  if (pool != nullptr) {
+    pool->ParallelForRange(rows, body);
+  } else {
+    body(0, rows);
+  }
+  return true;
+}
+
 // ---- 分派 -----------------------------------------------------------------
 
 float DotRowAvx2(uint32_t type, const float* a, const uint8_t* w, int64_t k) {
@@ -306,6 +543,31 @@ DotRowFn Avx2DotRow() {
 }
 
 bool Avx2SupportsType(uint32_t type) {
+#if defined(__AVX2__)
+  switch (type) {
+    case kGgmlQ4_K:
+    case kGgmlQ6_K:
+    case kGgmlQ8_0:
+    case kGgmlF32:
+      return true;
+    default:
+      return false;
+  }
+#else
+  (void)type;
+  return false;
+#endif
+}
+
+MatMulBlockedFn Avx2MatMulBlocked() {
+#if defined(__AVX2__)
+  return &MatMulBlockedAvx2;
+#else
+  return nullptr;
+#endif
+}
+
+bool Avx2SupportsBlockedType(uint32_t type) {
 #if defined(__AVX2__)
   switch (type) {
     case kGgmlQ4_K:
