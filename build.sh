@@ -41,7 +41,7 @@ echo "[2/4] 链接动态库..."
 
 echo "[3/4] 链接命令行工具..."
 # 工具的编译单元要能 #include "npy.h" 这类同目录头，所以多一个 -Itools。
-for t in dump_gguf tok_check selftest forward_check gen_check chatml_check parse_check; do
+for t in dump_gguf tok_check selftest forward_check gen_check chatml_check parse_check sample_check; do
   if [ -f "tools/$t.cc" ]; then
     "$CXX" $CXXFLAGS -Itools $LDFLAGS -o "build/$t.exe" "tools/$t.cc" $OBJS
   fi
