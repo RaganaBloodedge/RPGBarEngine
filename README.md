@@ -6,9 +6,9 @@ RPGBar 的内置推理引擎。目标是把"玩家要自己配模型服务"变�
 > 状态：**M3 完成**（ChatML 渲染与官方模板逐字节一致，工具调用端到端打通）。
 > 已完成：GGUF 解析 / 15 种 ggml 量化类型反量化 / Qwen BBPE 分词器 /
 > 全序列前向 / KV Cache / 贪心生成 / ChatML 模板 / tool_call 解析。
-> 本地仓库已初始化，**暂不设 remote、不上传 GitHub**（按项目决定）。
-> 进度与设计依据见 `docs/DESIGN.md`：M0 见 §13，M1 见 §14，M2 见 §15，M3 见 §16。
-> **引擎不产随机性**（库里没有 RNG）—— 见下面「关于随机性」。
+>
+> 许可证 MIT。进度与设计依据见 `docs/DESIGN.md`：M0 见 §13，M1 见 §14，
+> M2 见 §15，M3 见 §16。**引擎不产随机性**（库里没有 RNG）—— 见下面「关于随机性」。
 
 ## 这是什么
 
@@ -71,7 +71,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-本机（MSYS2，没有 cmake）：
+MSYS2 环境（没有 cmake 时）：
 
 ```bash
 ./build.sh

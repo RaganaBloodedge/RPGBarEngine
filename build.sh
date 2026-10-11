@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh —— MSYS2 / MinGW-w64 快速构建（本机没装 cmake 时走这条）。
+# build.sh —— MSYS2 / MinGW-w64 快速构建（没有 cmake 的环境走这条）。
 # 有 cmake 的环境请用 CMakeLists.txt，两条路的产物一致。
 #
 # 两个硬性要求，改这个脚本时别丢：
