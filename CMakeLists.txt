@@ -20,7 +20,7 @@ endif()
 
 # 引擎的全部 .cc（rpg_engine.def 与头文件不在此列）。
 set(RPG_SOURCES
-  src/engine_stub.cc
+  src/engine.cc
   src/common.cc
   src/json.cc
   src/threads.cc
@@ -68,10 +68,10 @@ set_target_properties(rpg_engine PROPERTIES
 )
 
 # 命令行工具（dump_gguf / tok_check / selftest / forward_check / gen_check）。
-# 链接同一批源文件，避免重复编译；不含 engine_stub.cc（工具不走 C ABI）。
+# 链接同一批源文件，避免重复编译；不含 engine.cc（工具不走 C ABI）。
 set(RPG_TOOLS dump_gguf tok_check selftest forward_check gen_check chatml_check parse_check)
 set(RPG_LIB_SOURCES ${RPG_SOURCES})
-list(REMOVE_ITEM RPG_LIB_SOURCES src/engine_stub.cc)
+list(REMOVE_ITEM RPG_LIB_SOURCES src/engine.cc)
 
 foreach(tool IN LISTS RPG_TOOLS)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/${tool}.cc")
