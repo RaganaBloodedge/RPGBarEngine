@@ -1,7 +1,8 @@
 # RPGBarEngine 设计
 
-> 状态：**M0–M4 已完成**（含 M2.5 采样）。C ABI 已落地，宿主能加载权重、建会话、
-> 生成、释放；采样能按宿主给的 `temperature` 调整创造性。
+> 状态：**M0–M4 已完成**（含 M2.5 采样），**M5 完成一半** —— SIMD 融合反量化点积
+> 内核已落地，decode 达标（22.9 tok/s ≥ 15），prefill 还差一个数量级（见 §19）。
+> C ABI 已落地，宿主能加载权重、建会话、生成、释放；采样能按宿主给的 `temperature` 调整创造性。
 > 选型已定：**Qwen3-1.7B / Qwen3-4B**（2026-10-10 定案）。
 > **随机性归属（2026-10-11 M2.5 修正）**：引擎不持有有状态的 RNG；宿主给一个
 > **seed**，引擎用 counter-based 纯函数 `u = H(seed, 绝对位置)` 展开成随机序列
@@ -20,7 +21,7 @@
 | M2.5 采样（温度 / top-p） | **完成** | 108 组参数组合的筛选结果与 HF warpers 逐元素一致；随机源为 counter-based 纯函数（见 §18） |
 | M3 ChatML 模板 + tool_call 解析 | **完成** | 15 个用例逐**字节**与官方模板一致；工具调用端到端跑通（见 §16） |
 | M4 C ABI 落地 | **完成** | 10 个函数走 dll 全通过：句柄生命周期、与工具链结果一致、前缀复用逐位等价（见 §17） |
-| M5 SIMD 多线程 GEMM | 待开始 | — |
+| M5 SIMD 多线程 GEMM | **一半**（SIMD 已落地） | AVX2 融合点积内核与标量参考一致（相对 2.5e-8~4.9e-8）；decode 6.32→**22.9 tok/s 达标**；prefill 7.5→35.4 tok/s（离 100 还差，需分块，见 §19） |
 | M6 交叉编译 + 宿主打通 | 构建链已通 | `build/rpg_engine.dll` 零告警构建 |
 
 ---
@@ -242,6 +243,16 @@ C++ 没有稳定 ABI —— 不同编译器、不同 STL 版本之间传 `std::s
 | Qwen3-4B decode | **≥ 7 tok/s** | 主机端 DM 一轮约 250 token → **25–35s** |
 | Qwen3-4B prefill | ≥ 50 tok/s | — |
 
+**M5 实测（Qwen3-1.7B-Q4_K_M，i7-14650HX 16 线程，中文 64 token 提示词）**：
+
+| 场景 | M5 前（纯标量） | M5 后（AVX2 融合） | 目标 | 结论 |
+| --- | --- | --- | --- | --- |
+| 1.7B decode | 6.32 tok/s | **22.89 tok/s** | ≥ 15 | **达标（3.6×）** |
+| 1.7B prefill | 7.5 tok/s（8517 ms/64） | 35.4 tok/s（1806 ms/64） | ≥ 100 | **未达标（4.7×）** |
+
+decode 这一栏才是玩家真正感知的那个数（DM 一轮 ≈ 250 token）。prefill 的差距不是
+内核慢，而是**权重被重复读了 n_tokens 遍**（每个 token 都把整份权重扫一遍，见 §19.7）。
+
 **必须诚实记下的体验代价**：4B 在 CPU 上**每轮要几十秒** —— 这是"DM 走本地引擎"的固有代价，
 不是实现缺陷。缓解方向（按优先级）：更激进量化（Q4 → Q3）、更多线程、后续 GN 后端。
 若体验不可接受，DM 仍可切回云 API（Provider 层支持，见 `ENGINE-ARCHITECTURE.md` §4）。
@@ -260,18 +271,18 @@ C++ 没有稳定 ABI —— 不同编译器、不同 STL 版本之间传 `std::s
 | **M2.5** | 采样（温度 / top-p） | 确定性筛选（温度/截断/重归一化）与 HF 的 Temperature/TopK/TopP warpers **逐元素一致**；随机性是 counter-based 纯函数 `u = H(seed, 位置)`（**已通过**，见 §18） |
 | **M3** | ChatML 模板 + tool_call 解析 | 给定工具定义，能稳定产出结构化 `tool_calls`（**已通过**，见 §16） |
 | **M4** | C ABI + 多会话 | 同一模型两个会话互不干扰；前缀复用与冷启动结果一致（**已通过**，见 §17） |
-| **M5** | SIMD / 多线程 GEMM（移植 TinyGemmaCpp） | 达到 §9 性能目标 |
+| **M5** | SIMD / 多线程 GEMM（融合反量化点积） | decode / prefill 达到 §9 目标（**decode 已达标，prefill 待分块**，见 §19） |
 | **M6** | 交叉编译出 `rpg_engine.dll`，Unity P/Invoke 打通 | Unity 里调用成功生成一段合法 JSON |
 
 ---
 
 ## 11. 验证方法
 
-沿用 TinyGemmaCpp 已验证的分层对拍（每层都留可复现脚本），现在有十层：
+沿用 TinyGemmaCpp 已验证的分层对拍（每层都留可复现脚本），现在有**十一层**：
 
 | 层 | 对拍对象 | 判据 | 对应脚本 |
 | --- | --- | --- | --- |
-| 1 进程内自检 | 自己（不变量） | 124 项全过 | `selftest.cc` |
+| 1 进程内自检 | 自己（不变量） | 133 项全过 | `selftest.cc` |
 | 2 量化布局 | GGUF 写入器算出的 offset | 块尺寸与张量铺满推算一致 | `check_quant_layout.py` |
 | 3 量化语义 | `gguf.quants`（llama.cpp 官方算法） | **逐位**相同 | `xcheck_dequant.py` |
 | 4 分词 | 官方 tokenizer | 逐 **id** 一致 | `tok_ref.py` |
@@ -281,6 +292,7 @@ C++ 没有稳定 ABI —— 不同编译器、不同 STL 版本之间传 `std::s
 | 8 ChatML 渲染（M3） | HF 官方 `apply_chat_template` 跑官方模板原文 | 逐**字节**相同 | `check_chatml.py` |
 | 9 C ABI（M4） | 工具链路径 + 冷启动会话 | 结果完全相同；句柄生命周期正确 | `check_abi.py` |
 | 10 采样（M2.5） | HF 的 Temperature/TopK/TopP warpers | 筛选结果**逐元素**一致；随机源是纯函数且均匀 | `check_sample.py` |
+| 11 融合点积（M5） | 标量参考 + float64 独立参考 | `max\|Δ\| / Σ\|a·w\| ≤ 1e-6`（实测噪声底 ~5e-8） | `check_dotrow.py` |
 
 M3 另有一条端到端验收（不在分层表里，因为它要跨好几层）：`check_toolcall.py`
 —— 渲染带工具定义的 prompt → 引擎贪心生成 → 解码 → 解析出结构化 `tool_calls`，
@@ -575,9 +587,10 @@ O(1) 而不是 O(1e-6)。
   层，返回空 logits 而不是一个"看起来能用"的错值。
 - **单线程 attention**：GEMM 按输出行并行，attention 走标量。这是刻意的 ——
   并行会改浮点累加顺序，M1 阶段的首要目标是可对拍。
-- **prefill 性能还很差**：Q8_0 上 64 token 用 9.2 s（约 7 tok/s），
-  离 §9 的 100 tok/s 目标差一个数量级。这是纯标量 `DotRowQuant`
-  （每元素一次反量化）的必然结果，M5 用 SIMD + 融合反量化点积解决。
+- **prefill 性能**：Q8_0 上 64 token 用 9.2 s（约 7 tok/s），离 §9 的 100 tok/s 目标
+  差一个数量级。这是纯标量 `DotRowQuant`（每元素一次反量化）的必然结果。
+  **已于 M5 处理一半**：融合反量化点积把 Q4_K_M 的 64 token 提到 1.81 s（35.4 tok/s），
+  但权重仍被每个 token 各读一遍；剩下的一步是"多 token 共用一次权重读"的分块（§19.7）。
 
 ### 14.6 下一步（M2）
 
@@ -674,10 +687,11 @@ United Kingdom is London. The` —— 24 步里没有跑偏、没有重复。
 
 ### 15.5 已知限制
 
-- **decode 约 9 tok/s**（Q8_0，单 token 前向约 108 ms）。这是纯标量
-  `DotRowQuant` 的必然结果（读每个权重元素都要现反量化一次），M5 用
-  SIMD + 融合反量化点积解决，目标 §9 的 100 tok/s。
-- **prefill 仍是整段全序列**，没有分块，64 token 约 6.6 s。M5 一并解决。
+- **decode ≈ 9 tok/s（Q8_0）/ 6.3 tok/s（Q4_K_M）** —— 当时是纯标量 `DotRowQuant`
+  的必然结果（读每个权重元素都要现反量化一次）。**M5 已解决**：Q4_K_M 实测
+  **22.89 tok/s**，超过 §9 的 15 tok/s 目标（§19.5）。
+- **prefill 仍是整段全序列**，没有分块。M5 把 Q4_K_M 的 64 token 从 8.5 s 降到 1.81 s，
+  但没有改"每个 token 各读一遍权重"的循环结构 —— 那一步（多 token 分块）仍待做（§19.7）。
 - **attention 仍走标量、单线程**。按 head 并行不改每个输出的累加顺序（可以并行），
   但当前瓶颈不在这里，留到 M5 与 GEMM 一起做。
 - **cache 只支持顺序追加**。多轮对话靠"前缀复用"：`ForwardFull` 已支持从
@@ -1043,4 +1057,147 @@ counter-based RNG 与 PyTorch 的 `torch.multinomial` 不可能逐数对齐。
 
 SIMD + 融合反量化点积（移植 TinyGemmaCpp 的内核），把 prefill / decode 提速到 §9
 的目标。采样里的 top_p 排序也在那一轮顺带优化。
+
+**已执行，见 §19。**
+
+---
+
+## 19. M5 落地记录（SIMD 部分已完成，prefill 分块待做）
+
+### 19.1 交付物
+
+```
+src/matmul.h              融合点积的对外接口（DotRowQuant / DotRowQuantRef / ActiveKernelName）
+src/matmul.cc             分派（CPU 特性选择，静态初始化期定一次）+ 标量参考实现
+src/matmul_avx2.cc        AVX2 融合内核：Q4_K / Q6_K / Q8_0 / F32（唯一开 -mavx2 -mfma 的 TU）
+src/matmul_internal.h     两个 TU 之间的内部声明
+src/quant.h/.cc           DotRowQuant 迁出；新增 kMaxBlockElems 与 GetScaleMinK4Bytes（导出给 SIMD 复用）
+tools/dotrow_check.cc     探针：从真实张量取一行权重，导出 SIMD / 标量 / 反量化权重 / 激活的 npy
+tools/check_dotrow.py     第 11 层判据
+tools/selftest.cc         +9 条内核一致性断言（不需要模型）
+tools/run_checks.sh       十层 → 十一层
+build.sh / CMakeLists.txt 只对 matmul_avx2.cc 开 -mavx2 -mfma
+```
+
+### 19.2 一条必须澄清的移植口径：**能移植的是结构，不是 kernel**
+
+§7 写的是"移植 TinyGemmaCpp 的 matmul.cc"。动手时发现**照抄不了**：参考实现的
+内核是针对 `.sbs` 的 SFP/BF16/F32（gemma.cpp 私有格式）写的，而本引擎的权重是
+GGUF 的 ggml 量化类型（Q4_K/Q6_K/Q8_0），位布局完全不同 —— 连一个函数都用不上。
+
+真正沿用的是**三件事**，它们才是性能的来源：
+
+1. **融合反量化**：在寄存器里把量化权重现解成 f32、立刻 FMA，不落内存。
+   M1 阶段慢的根因正是"读每个元素反量化一次 + 落一趟栈"（§14.5）。
+2. **4 个独立累加器 + 最后一次性 HSum**：既打满 FMA 端口，也让舍入误差保持
+   对数级增长（与 `kernels.h` 的 `Dot` 同一条理由）。
+3. **按输出行并行**（`MatMulBatch` 已有的切分方式）。
+
+这一条要记明：**下次再有人说"移植那个 GEMM"，先问清楚权重格式是否一致。**
+
+### 19.3 分派与编译隔离
+
+`matmul_avx2.cc` 是**全项目唯一**开 `-mavx2 -mfma` 的编译单元。这不是洁癖：
+
+> 若给整个目标加 `-march=native`（参考实现的做法），这个 dll 在**没有 AVX2 的
+> CPU 上加载即非法指令崩溃**。而它是要丢进 Unity、发给别人的游戏里的。
+
+所以 AVX2 关在一个 TU 里，由 `matmul.cc` 在**静态初始化期**用
+`__builtin_cpu_supports("avx2") && ("fma")` 选一次函数指针。选一次而不是每次调：
+`MatMulBatch` 会在 worker 线程里调内核，惰性初始化会有数据竞争。
+
+标量实现**不删**（`DotRowQuantRef`）。它有不可替代的两个用途：非 AVX2 机器的
+兜底，以及第 11 层的对拍基准。环境变量 `RPGBAR_NO_SIMD=1` 可强制走标量 ——
+用来做"有 SIMD / 无 SIMD"的同机对照，收益才归因得干净。
+
+**只覆盖 Q4_K / Q6_K / Q8_0 / F32**：这正好是线上两份权重的全部（Q4_K_M =
+Q4_K×168 + Q6_K×29 + F32×113；Q8_0 = Q8_0×197 + F32×113）。其余类型（Q4_0/Q5_*/
+Q2_K/Q3_K/Q8_K/F16）**有意不做** —— 没有权重用到它们，写了也是没测过的代码，
+走标量兜底更诚实。
+
+### 19.4 判据：为什么"与官方逐 token 一致"不够
+
+端到端判据（第 6/7 层）仍然全绿，但**它挡不住内核写错**：AVX2 内核如果把 Q6_K
+的 `qh` 位段取错两位，logits 只会偏移一点点，可能几十层之后才以"输出变味"的
+形式暴露 —— 而归因成本极高。
+
+所以新增第 11 层，贴身判据：
+
+1. **参考物是 float64 的 `a @ w`**，精度远高于两边的 float32 实现。
+2. **归一化用 `Σ|a_i·w_i|`（即 `|a| @ |w|`），不是 `|ref|`** —— 点积有抵消，
+   `ref` 可能接近 0 而逐项之和很大。**这里踩过坑**：第一版写成 `a @ |w|`，
+   那个和会被正负相消到接近 0，把正常的 float32 舍入差放大成 `1e24`，
+   看起来像内核崩了，其实是判据写错了（与 §14.2 同一类错误）。
+3. 阈值**先量噪声底再定**：`k=6144` 上实测 SIMD-vs-标量 2.5e-8 ~ 4.5e-8，
+   两边各自 vs float64 参考同等量级。取 **1e-6**（约 20 倍余量）。
+   而真写错位段会偏到 1e-2 量级，一撞就红。
+4. **不做"逐位相同"**：那等于要求 SIMD 与标量用同一条累加顺序，与"用 4 个独立
+   累加器提速"的目的直接矛盾。
+
+第 1 层（`selftest.cc`）另加 9 条**不需要模型**的断言：用"结构合法"的权重缓冲
+（scale 字段显式写有限值、量化字节确定性随机）差分测 SIMD 与标量。
+⚠️ **不能纯随机字节**：随机位模式会命中 fp16 的 Inf/NaN，两边都算成 NaN，
+`|x-y| < tol` 会以 NaN 的形式**假失败**。
+⚠️ **F32 那条一开始是空测**：`switch` 漏了 F32 分支 → 缓冲全零 → 相对误差
+恰好 `0.0e+00`。"误差正好是 0"是这类 vacuous 断言的征兆，值得记一笔。
+
+### 19.5 实测
+
+Qwen3-1.7B-Q4_K_M，i7-14650HX（16 线程），中文 64 token 提示词：
+
+| 场景 | M5 前 | M5 后 | 加速 | §9 目标 |
+| --- | --- | --- | --- | --- |
+| prefill 64 token | 8517 ms（7.5 tok/s） | **1806 ms（35.4 tok/s）** | 4.7× | ≥100（未达） |
+| decode | 6.32 tok/s | **22.89 tok/s** | 3.6× | ≥15（**达标**） |
+
+另外更早的一次同机对照（Q8_0）显示 decode 从 9 tok/s 提到 ~20+。这里用 Q4_K_M
+的数字，因为它是线上实际用的那份。
+
+### 19.6 一个环境坑：`ld` 覆盖已存在的输出文件会**静默失败**
+
+`build.sh` 链接时曾长期失败，现象极具误导性：
+
+```
+[2/4] 链接动态库...
+collect2.exe: error: ld returned 1 exit status
+```
+
+**除了这一行什么都没有** —— `ld` 自己的诊断（`undefined reference` 等）全被吞掉。
+排查到真实原因的路径：绕开 `collect2` 直接调 `ld`，错误才露出来。
+
+两个叠加的原因：
+
+1. `build/obj/engine_stub.o` 是**孤儿目标文件**（`src/engine_stub.cc` 从未入库、
+   早已不存在），它和 `engine.o` 重复定义同一批 `rpg_engine_*` 符号。
+   → 本环境**删文件被拦**，所以它一直躺着没被清掉。
+2. 即使对象都对，`ld` 直接写 `build/rpg_engine.dll` 仍会失败 —— 本环境**阻止
+   对已存在文件做"删除 + 重建"**（`cp` 覆盖报 `Device or resource busy`），
+   而 `ld` 正是这么干的。
+
+**对策（已写进 build.sh）**：先链到 `*.new`，再 `mv -f` 就位 —— `mv` 走 rename，
+不受该策略影响。与之前 `-pipe`（编译期临时 `.s` 落不了盘）是同一类环境对策。
+
+### 19.7 仍未完成的两项
+
+**(a) prefill 分块。** 现在 `MatMulBatch` 的循环是 `i = t * rows + r`：对每个
+token，都把整份权重重新扫一遍。64 个 token 就是 64 倍权重流量 —— 这是 prefill
+卡在 35 tok/s 的原因，**不是内核慢**。修法是写一个"多 token 共用一次权重读"的
+微内核（权重解进寄存器后对 T 个 token 一起 FMA，本质是把 GEMV 变成 MR×8 的
+小 GEMM）。
+
+> 顺带排除一条看起来更简单的路：把权重行先整体反量化到 f32 缓冲、再对所有 token
+> 复用。这条**会变慢** —— Q4_K 一行 6144 元素只占 3456 字节，反量化后是 24576
+> 字节（8×）。省下的重复读是 221 KB，付出的写+读却是 1.57 MB。
+
+**(b) top_p 的排序。** 现在用 `std::sort`（vocab 151936），每个采样 token 多花
+约几毫秒。只在 `temperature > 0` 时走这条路（贪心不经过它），而线上 DM 的
+temperature 是 0.8 —— 所以在热路径上。改成 partial sort / 堆选即可，属独立小改。
+
+**这两项都不影响 decode 达标的结果** —— decode 才是玩家感知到的那个数。
+
+### 19.8 下一步（M6）
+
+交叉编译 + Unity P/Invoke 打通：Unity 里调用成功生成一段合法 JSON。
+`build/rpg_engine.dll` 已经是零告警、全静态链接（不依赖 `libwinpthread-1.dll`），
+剩下的主要是宿主侧的 P/Invoke 声明与回调约定。
 
