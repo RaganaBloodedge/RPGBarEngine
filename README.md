@@ -3,12 +3,14 @@
 RPGBar 的内置推理引擎。目标是把"玩家要自己配模型服务"变成"装完游戏就能选到一个模型"——
 引擎编进游戏本体，权重随包分发，进程内调用，零外部依赖、零 HTTP 往返。
 
-> 状态：**M4 完成** —— C ABI 落地，宿主已经能真的加载权重、建会话、生成、释放。
+> 状态：**M0–M4 完成**（含 M2.5 采样）—— C ABI 已落地，宿主能真的加载权重、建会话、
+> 生成、释放；采样能按宿主给的 `temperature` 调节创造性。
 > 已完成：GGUF 解析 / 15 种 ggml 量化类型反量化 / Qwen BBPE 分词器 /
-> 全序列前向 / KV Cache / 贪心生成 / ChatML 模板 / tool_call 解析 / C ABI。
+> 全序列前向 / KV Cache / 生成（贪心 + 温度采样）/ ChatML 模板 / tool_call 解析 / C ABI。
 >
-> 许可证 MIT。进度与设计依据见 `docs/DESIGN.md`：M0 见 §13，M1 见 §14，
-> M2 见 §15，M3 见 §16，M4 见 §17。**引擎不产随机性**（库里没有 RNG）—— 见下面「关于随机性」。
+> 许可证 MIT。进度与设计依据见 `docs/DESIGN.md`：M0 见 §13，M1 见 §14，M2 见 §15，
+> M3 见 §16，M4 见 §17，M2.5 见 §18。**引擎里没有有状态的 RNG** —— 随机性来自宿主
+> 给的 seed，引擎只做纯函数展开，见下面「关于随机性」。
 
 ## 这是什么
 
@@ -106,11 +108,11 @@ python scripts/fetch_model.py --list          # 看所有 preset
 bash tools/run_checks.sh
 ```
 
-一次跑完八层检查，缺哪一层会明确说明而不是静默跳过：
+一次跑完十层检查，缺哪一层会明确说明而不是静默跳过：
 
 | 层 | 手段 | 当前结果 |
 | --- | --- | --- |
-| 1 进程内自检 | `selftest.exe` | 106/106 |
+| 1 进程内自检 | `selftest.exe` | 124/124 |
 | 2 量化块尺寸 | `check_quant_layout.py` 用 GGUF 写入器的 offset 反推 | 全部一致，张量无缝铺满 |
 | 3 量化语义（逐位） | `xcheck_dequant.py` vs `gguf.quants`（llama.cpp 官方算法） | **逐位相同**（含 3.1 亿元素的整张词表） |
 | 4 分词器 | `tok_ref.py` 对 HF `tokenizers` | 3031/3031 逐 id 一致 |
@@ -119,8 +121,10 @@ bash tools/run_checks.sh
 | 7 生成（M2） | `check_generate.py` vs PyTorch 官方实现 | 3 组合 **逐 token 一致**，cache 自检逐位相同 |
 | 8 ChatML 渲染（M3） | `check_chatml.py` vs HF `apply_chat_template` 跑官方模板原文 | 15/15 用例逐**字节**一致 |
 | 9 C ABI（M4） | `check_abi.py` 用 ctypes 走 `rpg_engine.dll`（宿主视角） | 35/35：导出表、句柄生命周期、与工具链结果一致、前缀复用逐位等价、响应形状 |
+| 10 采样（M2.5） | `check_sample.py` vs HF 的 Temperature/TopK/TopP warpers | 108 组筛选**逐元素**一致；随机源纯函数且均匀 |
 
-第 9 层不需要 `torch`，所以它在前 8 层跑不起来的机器上照样能跑。
+第 9 层不需要 `torch`，所以它在前 8 层跑不起来的机器上照样能跑；第 10 层需要
+`torch` / `transformers`，但**不需要权重**（它验的是采样器本身）。
 
 ```bash
 # 第 6~8 层的基准是官方实现，需要一个带 torch / transformers / gguf 的解释器。
@@ -147,6 +151,10 @@ python tools/check_generate.py                      # M2 全部组合
 python tools/check_chatml.py                        # M3 第 8 层（逐字节）
 python tools/check_toolcall.py                      # M3 端到端（工具调用）
 python tools/check_abi.py                           # M4 第 9 层（宿主视角，走 dll）
+python tools/check_sample.py                        # M2.5 第 10 层（采样器，不需权重）
+./build/sample_check.exe --logits L.bin --temperature 0.8 --out-probs P.bin  # 看筛选后的分布
+./build/sample_check.exe --rng --seed 42 --counter 0 --count 5               # 看 counter-based 随机数
+./build/sample_check.exe --logits L.bin --temperature 2.0 --u 0.95           # 同一个 u，看落点
 ./build/chatml_check.exe --case tests/chatml/dm_toolcall.case.json   # 渲染一份 ChatML
 ./build/parse_check.exe --text-file runs/xxx.raw.txt                 # 解析一段输出
 python tools/check_noise_floor.py models/Qwen3-1.7B-Q8_0.gguf --layers 12 --tokens-from runs/zh.tokens.txt
@@ -256,37 +264,45 @@ char*   rpg_engine_model_info(int32_t model);
 `tools/check_abi.py` 钉了三条守卫：响应恰好四键、每个 `tool_call` 恰好两键，再加一条
 静态检查确认解析层的非法分支上仍有日志、且日志里带上了 `arguments_raw`。
 
-### 关于随机性：引擎里没有 RNG
+### 关于随机性：引擎里没有有状态的 RNG
 
-**库里不含任何随机数生成器，也不该有。** 理由不是洁癖，是三条实际的：
+**库里没有 `srand`、没有序列推进、没有全局状态。** 随机性只有一个入口：**宿主传
+进来的 `seed`**。引擎按 counter-based 纯函数把它展开：
 
-1. **对齐 RPGBar 的"骰子只有一个来源"**。项目里已经有这条纪律：模型与引擎只产出
-   "权重或分布"，从不自己掷骰（骰点走服务端 `dice.roll_check`，NPC 反应落点走
-   `dice.weighted_pick`）。引擎若自建一套 RNG，就是在同一条纪律上开口子。
-2. **可复现**。随机流集中在宿主侧，才能做到"同一个房间种子 + 同一串玩家输入 →
-   一模一样的剧情"。多会话（DM 与小助手共用一份权重）若共享一条 RNG，谁先谁后
-   还会互相扰动随机流。
-3. **引擎是纯函数**。同一输入必得同一输出 —— 这对本项目的对拍验证是前提
-   （第 6、7 层的判据都建立在"确定性"上）。
+```
+u_i = H(seed, i)        // i = 该 token 在 KV Cache 里的绝对位置
+```
 
-所以分工是：
+`H` 就是一次 SplitMix64 混合 —— 它和 `argmax` 一样是纯函数：同一个 `(seed, 位置)`
+永远得到同一个 `u`。所以"引擎是纯函数"这条对拍前提没有被破坏。
+
+分工是：
 
 | 步骤 | 谁做 | 要随机数吗 |
 | --- | --- | --- |
 | 算 logits | 引擎（前向） | 不要 |
-| 温度 / top-k / top-p 筛选 | 引擎（纯函数，**M2.5 实现**） | 不要 |
-| 贪心取最大 | 引擎（M2 已实现） | 不要 |
-| 按概率抽一个 | **宿主** | **要一个 `[0,1)`** |
+| 温度 / top-k / top-p 筛选 | 引擎（`FilterToProbs`，纯函数） | 不要 |
+| 按累积概率做逆变换 | 引擎（用上面那个 `u`） | 用，但 `u` 是纯函数算出来的 |
+| 提供 seed 与温度 | **宿主** | **不需要自己攒随机数** |
+
+**温度和种子是两条互不干涉的链。** 温度只缩放 logits（改变分布的形状），种子只决定
+随机数 —— 两者到最后一步"用 u 在分布上切一刀"才汇合。所以：
+
+- 同一个 `u`、不同温度 → **切出不同的 token**（配合 `logits = [4, 2, 0]`、
+  `u = 0.95`：T = 0.5 选中 A，T = 1.0 选中 B，T = 2.0 选中 C）；
+- 温度调到 0 → 分布变成一根尖刺，**无论种子是什么都选同一个 token**（输出确定）。
 
 宿主侧那个"创造力旋钮"就是 **temperature**：调到 0 走贪心（稳定，适合工具调用与
-JSON 输出），调高则分布变平、更容易选到低概率的表达（更适合叙事）。DM 与小助手
-可以各自设一个。设计原委见 `docs/DESIGN.md` §12 #6。
+JSON 输出），调高则分布变平、更容易选到低概率的表达（更适合叙事）。**top_k / top_p
+由引擎钉住**（`top_p = 0.95`、`top_k` 关闭），宿主不必理解它们的相互作用。DM 与小
+助手各设各的温度、各拿各的 seed。设计原委见 `docs/DESIGN.md` §12 #6 与 §18。
 
 ## 当前限制
 
-- **只能贪心**：温度 / top-p / top-k 还没有代码（M2.5）。请求里的 `temperature` /
-  `top_p` **目前只是被收下、不生效** —— 别以为调了它输出就会变。按上面的分工，即使
-  做，引擎也只出确定性分布，抽样由宿主完成。
+- **默认仍是贪心**：`temperature <= 0`（默认值）走贪心 —— 这是刻意的向后兼容，
+  不传 `temperature` 的老请求行为与 M4 逐位一致。要采样就传一个正的温度（上限
+  2.0，超出会被钳制并打一条警告）。`top_k` / `top_p` 目前宿主调不了，由引擎固定
+  （0.95 / 关闭）。
 - **decode 与 prefill 都慢**：Q8_0 上 prefill 64 token 约 6.6 s、decode 约 9 tok/s，
   离目标 100 tok/s 差一个数量级。这是纯标量反量化点积的必然结果（读每个权重元素都要
   现反量化一次），M5 用 SIMD + 融合反量化点积解决。
@@ -301,4 +317,4 @@ JSON 输出），调高则分布变平、更容易选到低概率的表达（更
 - 只支持 Qwen3 架构；配置全部从 GGUF 读，扩族是"加一个前向 + 一套模板"，不是重写。
 
 里程碑与验收判据见 `docs/DESIGN.md` §10；M0 记录见 §13，M1 见 §14，M2 见 §15，
-M3 见 §16，M4 见 §17。
+M3 见 §16，M4 见 §17，M2.5 见 §18。
