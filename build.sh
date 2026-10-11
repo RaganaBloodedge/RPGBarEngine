@@ -63,7 +63,7 @@ mv -f build/librpg_engine.a.new build/librpg_engine.a
 echo "[3/4] 链接命令行工具..."
 # 工具的编译单元要能 #include "npy.h" 这类同目录头，所以多一个 -Itools。
 # 同样先链 .new 再 mv -f（理由见上一步）。
-for t in dump_gguf tok_check selftest forward_check gen_check chatml_check parse_check sample_check dotrow_check; do
+for t in dump_gguf tok_check selftest forward_check gen_check chatml_check parse_check sample_check dotrow_check prefill_prof; do
   if [ -f "tools/$t.cc" ]; then
     "$CXX" $CXXFLAGS -Itools $LDFLAGS -o "build/$t.exe.new" "tools/$t.cc" $OBJS
     mv -f "build/$t.exe.new" "build/$t.exe"

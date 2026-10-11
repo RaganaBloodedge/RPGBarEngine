@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(RPGBarEngine VERSION 0.3.0 LANGUAGES CXX)
+project(RPGBarEngine VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -82,7 +82,7 @@ set_target_properties(rpg_engine PROPERTIES
 
 # 命令行工具（dump_gguf / tok_check / selftest / forward_check / gen_check）。
 # 链接同一批源文件，避免重复编译；不含 engine.cc（工具不走 C ABI）。
-set(RPG_TOOLS dump_gguf tok_check selftest forward_check gen_check chatml_check parse_check sample_check dotrow_check)
+set(RPG_TOOLS dump_gguf tok_check selftest forward_check gen_check chatml_check parse_check sample_check dotrow_check prefill_prof)
 set(RPG_LIB_SOURCES ${RPG_SOURCES})
 list(REMOVE_ITEM RPG_LIB_SOURCES src/engine.cc)
 
