@@ -19,7 +19,9 @@ CXX="${CXX:-g++}"
 mkdir -p build/obj
 
 INCLUDES="-Iinclude -Isrc"
-CXXFLAGS="-std=c++20 -O2 -fPIC -Wall -Wextra -DRPG_ENGINE_BUILD $INCLUDES"
+# -pipe：汇编通过管道交给 as，不落临时 .s 文件。省 IO，也让构建在没有
+#      可写临时目录（或删除被安全策略拦住）的机器上照样能跑。
+CXXFLAGS="-std=c++20 -O2 -fPIC -pipe -Wall -Wextra -DRPG_ENGINE_BUILD $INCLUDES"
 LDFLAGS="-static -static-libgcc -static-libstdc++"
 
 echo "[1/4] 编译引擎对象..."
@@ -39,7 +41,7 @@ echo "[2/4] 链接动态库..."
 
 echo "[3/4] 链接命令行工具..."
 # 工具的编译单元要能 #include "npy.h" 这类同目录头，所以多一个 -Itools。
-for t in dump_gguf tok_check selftest forward_check gen_check; do
+for t in dump_gguf tok_check selftest forward_check gen_check chatml_check parse_check; do
   if [ -f "tools/$t.cc" ]; then
     "$CXX" $CXXFLAGS -Itools $LDFLAGS -o "build/$t.exe" "tools/$t.cc" $OBJS
   fi
