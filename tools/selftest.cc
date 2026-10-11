@@ -23,6 +23,7 @@
 #include "common.h"
 #include "dtypes.h"
 #include "json.h"
+#include "matmul.h"
 #include "quant.h"
 #include "sampler.h"
 #include "tool_parser.h"
@@ -642,6 +643,134 @@ void TestSampler() {
   }
 }
 
+// ---------------------------------------------------------------- M5 融合内核
+
+// 确定性伪随机（xorshift64*）。固定种子 → 失败能原样重跑。
+uint64_t KxMix(uint64_t& s) {
+  s ^= s >> 12;
+  s ^= s << 25;
+  s ^= s >> 27;
+  return s * 0x2545F4914F6CDD1Dull;
+}
+
+void KxFill(uint8_t* p, int64_t n, uint64_t& s) {
+  for (int64_t i = 0; i < n; ++i) p[i] = static_cast<uint8_t>(KxMix(s) >> 33);
+}
+
+void KxPutF16(uint8_t* p, float v) {
+  const uint16_t h = rpg::F32ToF16(v);
+  p[0] = static_cast<uint8_t>(h & 0xFF);
+  p[1] = static_cast<uint8_t>(h >> 8);
+}
+
+// 造一个"结构合法"的权重缓冲：**scale 字段显式写成有限值**，量化字节确定性
+// 随机。不做成纯随机字节是有原因的 —— 随机字节会命中 fp16 的 Inf/NaN，
+// 两边都算成 NaN，`|simd - scalar| < tol` 会以 NaN 的形式**假失败**。
+//
+// 这仍是一个有效的差分测试：两个实现看到的是同一串位模式，若谁把 nibble 的
+// 高低半字节、或 Q6_K 的 qh 位段取错，算出来的就不是同一个数。
+void KxMakeWeights(uint32_t type, int64_t k, uint64_t& seed,
+                   std::vector<uint8_t>& out) {
+  const rpg::GgmlTypeInfo* ti = rpg::TypeInfo(type);
+  out.assign(static_cast<size_t>(rpg::TypeRowBytes(type, k)), 0);
+  if (type == rpg::kGgmlF32) {
+    // f32 直接写有限值：随机位模式同样会命中 NaN/Inf（第一版漏了这条，
+    // 于是缓冲全零、断言变成 vacuous —— 实测相对误差 0.0e+00，正是这个征兆）。
+    float* f = reinterpret_cast<float*>(out.data());
+    for (int64_t i = 0; i < k; ++i) {
+      f[i] = (static_cast<float>(KxMix(seed) >> 40) / 16777216.0f - 0.5f) * 2.0f;
+    }
+    return;
+  }
+  for (int64_t off = 0; off < static_cast<int64_t>(out.size());
+       off += ti->block_bytes) {
+    uint8_t* b = out.data() + off;
+    switch (type) {
+      case rpg::kGgmlQ8_0:  // d(fp16) | qs[32]
+        KxPutF16(b, 1.0f);
+        KxFill(b + 2, 32, seed);
+        break;
+      case rpg::kGgmlQ4_K:  // d | dmin | scales[12] | qs[128]
+        KxPutF16(b + 0, 1.0f);
+        KxPutF16(b + 2, 0.5f);
+        KxFill(b + 4, 140, seed);
+        break;
+      case rpg::kGgmlQ6_K:  // ql[128] | qh[64] | scales[16] | d(fp16)
+        KxFill(b, 208, seed);
+        KxPutF16(b + 208, 1.0f);
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+// M5：SIMD 内核必须与标量参考给出同一个数（差只应来自求和顺序）。
+//
+// 这一层**不需要模型**，所以它放在第 1 层而不是第 11 层：改内核后 1 秒内就能
+// 知道有没有把位段取错。带真实权重、带 float64 参考的做强判据在第 11 层
+// （tools/check_dotrow.py）。
+void TestMatmulKernels() {
+  std::printf("[融合点积内核]\n");
+
+  const char* kn = rpg::ActiveKernelName();
+  Check(std::strcmp(kn, "avx2") == 0 || std::strcmp(kn, "scalar") == 0,
+        std::string("生效内核名合法（现在是 ") + kn + "）");
+  const bool avx2 = std::strcmp(kn, "avx2") == 0;
+
+  const uint32_t simd_types[] = {rpg::kGgmlF32, rpg::kGgmlQ4_K,
+                                 rpg::kGgmlQ6_K, rpg::kGgmlQ8_0};
+  bool flags_ok = true;
+  for (uint32_t t : simd_types) {
+    if (rpg::HasSimdKernel(t) != avx2) flags_ok = false;
+  }
+  Check(flags_ok, "HasSimdKernel 与实际生效的内核一致");
+  Check(!rpg::HasSimdKernel(rpg::kGgmlQ5_0), "没写 SIMD 的类型报告 false");
+
+  struct Case {
+    uint32_t type;
+    int64_t k;
+    const char* name;
+  };
+  const Case cases[] = {
+      {rpg::kGgmlF32, 100, "F32"},  // 100 不是 8 的倍数，专测长度尾巴
+      {rpg::kGgmlF32, 512, "F32"},
+      {rpg::kGgmlQ8_0, 256, "Q8_0"},
+      {rpg::kGgmlQ4_K, 512, "Q4_K"},
+      {rpg::kGgmlQ4_K, 1024, "Q4_K"},
+      {rpg::kGgmlQ6_K, 512, "Q6_K"},
+  };
+  for (const Case& c : cases) {
+    uint64_t seed = 0x1234567ull + c.type * 131u + static_cast<uint64_t>(c.k);
+    std::vector<uint8_t> w;
+    KxMakeWeights(c.type, c.k, seed, w);
+
+    std::vector<float> a(static_cast<size_t>(c.k));
+    for (int64_t i = 0; i < c.k; ++i) {
+      a[i] = (static_cast<float>(KxMix(seed) >> 40) / 16777216.0f - 0.5f) * 8.0f;
+    }
+
+    const float x = rpg::DotRowQuant(c.type, a.data(), w.data(), c.k);
+    const float y = rpg::DotRowQuantRef(c.type, a.data(), w.data(), c.k);
+
+    // 归一化用 Σ|a_i·w_i|，**不是** |x| —— 点积有抵消，|x| 可能接近 0。
+    std::vector<float> wf(static_cast<size_t>(c.k));
+    rpg::DequantizeRow(c.type, w.data(), c.k, wf.data());
+    double scale = 0.0;
+    for (int64_t i = 0; i < c.k; ++i) {
+      scale += std::fabs(static_cast<double>(a[i]) *
+                         static_cast<double>(wf[i]));
+    }
+    const double err =
+        std::fabs(static_cast<double>(x) - static_cast<double>(y)) /
+        (scale > 0.0 ? scale : 1.0);
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "%s k=%lld SIMD 与标量一致（相对 %.1e）",
+                  c.name, static_cast<long long>(c.k), err);
+    Check(err < 1e-5, buf);
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -659,6 +788,7 @@ int main(int argc, char** argv) {
   TestToolParser();
   TestSimpleQuants();
   TestSampler();
+  TestMatmulKernels();
 
   std::printf("\n通过 %d，失败 %d\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
