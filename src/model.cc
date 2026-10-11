@@ -6,6 +6,7 @@
 #include "common.h"
 #include "dtypes.h"
 #include "kernels.h"
+#include "matmul.h"
 
 namespace rpg {
 namespace {

@@ -8,7 +8,8 @@
 // 融合点积（dequant 到寄存器里顺手 FMA）是 M5 的性能优化，会按 CPU 的 SIMD
 // 宽度写出好几套。M1 的对拍阶段必须有**一份和 SIMD 无关、和平台无关**的参考
 // 实现，否则"结果不对"的时候无法判断是模型逻辑错了还是内核写错了。
-// 所以这里先给纯标量 DequantizeRow，M5 再加 DotRowQuant。
+// 所以这里先给纯标量 DequantizeRow。M5 的 DotRowQuant（含 SIMD 分派）落在
+// matmul.h / matmul.cc，其标量参考实现复用本文件的 DequantizeRow。
 
 #ifndef RPGBAR_QUANT_H_
 #define RPGBAR_QUANT_H_
@@ -55,13 +56,17 @@ bool TypeSupported(uint32_t id);
 // n_elems 个该类型元素占多少字节。n_elems 必须是 block_elems 的整数倍。
 int64_t TypeRowBytes(uint32_t id, int64_t n_elems);
 
+// 所有受支持类型里最大的"块元素数"（QK_K = 256）。标量参考实现要在栈上解
+// 一个块，用这个常量开空间；SIMD 内核按固定块长展开，也拿它对上限断言。
+constexpr int64_t kMaxBlockElems = 256;
+
 // 把 src 里的 n_elems 个元素反量化为 f32 写进 dst。
 // 前置：TypeSupported(id)、n_elems % block_elems == 0。
 void DequantizeRow(uint32_t id, const uint8_t* src, int64_t n_elems, float* dst);
 
-// 配合 M5 的融合内核：把 a[0..k) 与该类型权重的一行做点积。
-// M1 阶段先用 DequantizeRow + 标量点积实现，M5 再换成 SIMD。
-float DotRowQuant(uint32_t id, const float* a, const uint8_t* w, int64_t k);
+// Q4_K / Q5_K 的 6-bit scale/min 拆包（ggml 的 get_scale_min_k4 同款）。
+// 给 SIMD 内核复用：每 256 元素块只调 8 次，不值得再写一份 SIMD 版。
+void GetScaleMinK4Bytes(int j, const uint8_t* q, uint8_t* d, uint8_t* m);
 
 }  // namespace rpg
 

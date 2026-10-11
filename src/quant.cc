@@ -368,6 +368,14 @@ void DeqQ8_K(const uint8_t* src, int64_t n, float* dst) {
 
 }  // namespace
 
+// 6-bit scale/min 拆包。Q4_K / Q5_K 用（即 ggml 的 get_scale_min_k4）。
+// 实现留在匿名命名空间里，这里只开一个对外的门 —— SIMD 内核（matmul_avx2.cc）
+// 要复用它：每块只跑 8 次，相对 256 个元素的 FMA 完全不是瓶颈，没必要为了省
+// 这点开销再写一份容易错的 SIMD 拆包（错了不崩、只静默算错）。
+void GetScaleMinK4Bytes(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
+  GetScaleMinK4(j, q, d, m);
+}
+
 const GgmlTypeInfo* TypeInfo(uint32_t id) {
   for (const auto& t : kTypes) {
     if (t.id == id) return &t;
@@ -435,36 +443,8 @@ void DequantizeRow(uint32_t id, const uint8_t* src, int64_t n_elems, float* dst)
   }
 }
 
-float DotRowQuant(uint32_t id, const float* a, const uint8_t* w, int64_t k) {
-  // M1 的参考实现：一次解一个块（块最大 256 元素），边解边点积。
-  // M5 会把它换成按 SIMD 宽度写的融合内核。
-  float tmp[QK_K];
-  const GgmlTypeInfo* t = TypeInfo(id);
-  RPG_CHECK(t != nullptr, "未知的 ggml 类型 id=%u", id);
-  RPG_CHECK(k % t->block_elems == 0, "点积长度 %lld 不是块大小 %lld 的整数倍",
-            static_cast<long long>(k), static_cast<long long>(t->block_elems));
-
-  // **多个累加器**，不是图省事，是为了精度。
-  // 单个串行累加器的舍入误差随长度**线性**增长（n 项最多积累 n·u·Σ|term|），
-  // 而 BLAS 的分块/向量化求和是对数级。k 到 6144 时这个差距实测是 4–5 倍 ——
-  // 与 M1 对拍时"我们比参考离真值远 5 倍"的现象完全对得上。
-  // 4 个独立部分和正好对应 M5 里 SIMD 的 4 个 lane，所以这个结构可以直接留用。
-  float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-  const int64_t nb = k / t->block_elems;
-  for (int64_t b = 0; b < nb; ++b) {
-    DequantizeRow(id, w + b * t->block_bytes, t->block_elems, tmp);
-    const float* ap = a + b * t->block_elems;
-    int64_t j = 0;
-    const int64_t lim = t->block_elems - 3;
-    for (; j < lim; j += 4) {
-      s0 += ap[j] * tmp[j];
-      s1 += ap[j + 1] * tmp[j + 1];
-      s2 += ap[j + 2] * tmp[j + 2];
-      s3 += ap[j + 3] * tmp[j + 3];
-    }
-    for (; j < t->block_elems; ++j) s0 += ap[j] * tmp[j];
-  }
-  return (s0 + s1) + (s2 + s3);
-}
+// DotRowQuant 已迁到 src/matmul.cc（M5）：那里多了 CPU 特性分派与 AVX2 内核，
+// 本文件只留"与 SIMD 无关"的反量化 —— 它是 M1 的对拍基准，必须保持纯标量。
+// 参考实现现在叫 DotRowQuantRef，同在新文件里。
 
 }  // namespace rpg
