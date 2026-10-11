@@ -1,6 +1,6 @@
 # RPGBarEngine 设计
 
-> 状态：**M2 已完成**（KV Cache + 贪心解码，逐 token 与 PyTorch 官方实现一致）。
+> 状态：**M3 已完成**（ChatML 渲染与官方模板逐字节一致；工具调用端到端打通）。
 > 选型已定：**Qwen3-1.7B / Qwen3-4B**（用户 2026-10-10 拍板）。
 > **随机性归属已拍板**：引擎不产随机数（§12 #6）。
 > 关联：`RPGBar-Unity/docs/ENGINE-ARCHITECTURE.md`（Agent 与 Provider 层设计）
@@ -15,7 +15,7 @@
 | M1 Qwen3 前向（标量） | **完成** | 3 个组合 × 29 项对拍全绿（见 §14） |
 | M2 KV Cache + 贪心解码 | **完成** | 3 个组合逐 token 一致 + cache 自检逐位相同（见 §15） |
 | M2.5 采样（温度 / top-p） | **未做**（等 §12 #6 的接口形状定案） | 引擎只出分布，随机数由宿主给 |
-| M3 ChatML 模板 + tool_call 解析 | 待开始 | — |
+| M3 ChatML 模板 + tool_call 解析 | **完成** | 15 个用例逐**字节**与官方模板一致；工具调用端到端跑通（见 §16） |
 | M4 C ABI 落地 | 占位实现已可加载 | 10 个导出函数实测可被 Python 加载 |
 | M5 SIMD 多线程 GEMM | 待开始 | — |
 | M6 交叉编译 + 宿主打通 | 构建链已通 | `build/rpg_engine.dll` 零告警构建 |
@@ -255,7 +255,7 @@ C++ 没有稳定 ABI —— 不同编译器、不同 STL 版本之间传 `std::s
 | **M1** | Qwen3 前向（无 KV Cache，标量） | 与 PyTorch 官方实现逐层对拍：**逐元素相对误差 p99 ≤ 2e-4，且每个位置的 argmax 一致**（判据修正的经过见 §14.2） |
 | **M2** | KV Cache + 贪心解码 | 贪心解码 N 个 token 与官方**逐 token** 一致（**已通过**，见 §15） |
 | **M2.5** | 采样（温度 / top-p） | 接口形状待定（§12 #6）。抽样**不在引擎内**，引擎只出确定性分布 |
-| **M3** | ChatML 模板 + tool_call 解析 | 给定工具定义，能稳定产出结构化 `tool_calls` |
+| **M3** | ChatML 模板 + tool_call 解析 | 给定工具定义，能稳定产出结构化 `tool_calls`（**已通过**，见 §16） |
 | **M4** | C ABI + 多会话 | 同一模型两个会话互不干扰（对拍验证） |
 | **M5** | SIMD / 多线程 GEMM（移植 TinyGemmaCpp） | 达到 §9 性能目标 |
 | **M6** | 交叉编译出 `rpg_engine.dll`，Unity P/Invoke 打通 | Unity 里调用成功生成一段合法 JSON |
@@ -264,17 +264,32 @@ C++ 没有稳定 ABI —— 不同编译器、不同 STL 版本之间传 `std::s
 
 ## 11. 验证方法
 
-沿用 TinyGemmaCpp 已验证的分层对拍（每层都留可复现脚本），现在有七层：
+沿用 TinyGemmaCpp 已验证的分层对拍（每层都留可复现脚本），现在有八层：
 
 | 层 | 对拍对象 | 判据 | 对应脚本 |
 | --- | --- | --- | --- |
-| 1 进程内自检 | 自己（不变量） | 69 项全过 | `selftest.cc` |
+| 1 进程内自检 | 自己（不变量） | 104 项全过 | `selftest.cc` |
 | 2 量化布局 | GGUF 写入器算出的 offset | 块尺寸与张量铺满推算一致 | `check_quant_layout.py` |
 | 3 量化语义 | `gguf.quants`（llama.cpp 官方算法） | **逐位**相同 | `xcheck_dequant.py` |
 | 4 分词 | 官方 tokenizer | 逐 **id** 一致 | `tok_ref.py` |
 | 5 跨量化档位 | Q8_0 与 Q4_K_M 的同一张量 | 高相关；F32 张量逐位相同 | `xcheck_quant.py` |
 | 6 前向（M1） | PyTorch 官方 `Qwen3ForCausalLM` | **相对误差 p99 ≤ 2e-4 且 argmax 一致** | `check_forward.py` |
 | 7 生成（M2） | PyTorch 官方 `Qwen3ForCausalLM` | **逐 token** 相同（比第 6 层更硬） | `check_generate.py` |
+| 8 ChatML 渲染（M3） | HF 官方 `apply_chat_template` 跑官方模板原文 | 逐**字节**相同 | `check_chatml.py` |
+
+M3 另有一条端到端验收（不在分层表里，因为它要跨好几层）：`check_toolcall.py`
+—— 渲染带工具定义的 prompt → 引擎贪心生成 → 解码 → 解析出结构化 `tool_calls`，
+同时与官方实现逐 token 对拍。
+
+**为什么第 8 层是"逐字节"而不是"语义等价"**：模板里的空格、`\n` 数量、空思考块
+的有无，都会影响模型的行为；"看起来差不多"的渲染没法解释"为什么输出不一样了"。
+参考侧用的是官方 `tokenizer_config.json` 里的 `chat_template` **原文**，所以比的
+对象是模板本身，不是"某个人对模板的理解"。
+
+**一个由此暴露的地基问题**：我们的 JSON 序列化原本是紧凑格式（`{"a":1}`）且浮点
+用 `%.17g`（0.7 → 0.69999999999999996）。而官方模板用 Jinja 的 `tojson`，输出是
+Python `json.dumps` 的默认样式（`{"a": 1}` 且用最短往返表示）。**这条对拍一开始
+就红了** —— 正是它逼出了 `Json::DumpPython()` 与最短往返浮点格式化（见 §16.3）。
 
 **为什么第 6 层是"相对误差"而不是"绝对误差"**：见 §14.2 —— 残差流里有一个
 量级 1.2e4 的离群维度，在那里 float32 的 1 ULP ≈ 1e-3，绝对判据失去意义。
@@ -656,10 +671,135 @@ United Kingdom is London. The` —— 24 步里没有跑偏、没有重复。
 
 ### 15.6 下一步
 
-1. **M3 ChatML 模板 + tool_call 解析**（优先）：Qwen3 的 `<|im_start|>` /
-   `<|im_end|>`，`enable_thinking=false` 时要在 prompt 里放一个空的
-   ` thinking\n\n\n\n`，以及从输出里解析 `tool_calls`。做完这一步，宿主侧
-   `server/agents/*` 的提示词才真正能跑在本引擎上。
+1. ~~**M3 ChatML 模板 + tool_call 解析**~~ —— **已完成**，见 §16。
+   （本节最初写的"空 ` thinking\n\n\n\n`"是**错的**：实测官方模板里的空思考块是
+   `<think>\n\n</think>\n\n`，且特殊 token 就叫 `<think>` / `</think>`，无前导空格。
+   凭记忆写必然出错 —— 所以 §16 把"参考物是官方模板原文"这件事放在最前面。）
 2. **M2.5 采样**：接口形状按 §12 #6 —— 引擎出确定性分布，随机数由宿主给。
-   M3 优先于它：DM 生成要的是**稳定的结构化输出**（温度 0 就够），而工具调用
-   是硬需求；"创造性"这个旋钮是给想调的人调的，不是主路径。
+   现在 M3 已通，采样是下一个"想做再做"的项：DM 生成要的是**稳定的结构化输出**
+   （温度 0 就够），而工具调用是硬需求；"创造力"这个旋钮是给想调的人调的，
+   不是主路径。**M4（C ABI）优先于它** —— 宿主现在就差一个能调用的入口。
+
+---
+
+## 16. M3 落地记录（已完成）
+
+### 16.1 交付物
+
+```
+src/chat_template.h/.cc   Qwen3 ChatML 渲染 + messages/tools 的 JSON 解析
+src/tool_parser.h/.cc     输出解析：剥控制标记 / 思考块 / 抽 <tool_call>
+src/json.h/.cc            + DumpPython（Python 的 json.dumps 样式）
+                          + 数字保留整数字面量、浮点用最短往返表示
+tools/chatml_check.cc     渲染一份 case 并落盘
+tools/chatml_ref.py       参考侧：HF apply_chat_template 跑官方模板原文
+tools/check_chatml.py     第 8 层：逐【字节】对拍（15 个用例）
+tools/parse_check.cc      把一段输出文本喂进解析器，打印结构化结果
+tools/check_toolcall.py   M3 端到端验收：工具定义 → 生成 → 结构化 tool_calls
+tests/chatml/dm_toolcall.case.json   带 2 个工具定义的 DM 场景
+```
+
+### 16.2 参考物是**官方模板原文**，不是"我们对模板的理解"
+
+`scripts/fetch_model.py` 的 REFS 里加了 `tokenizer_config.json` —— 它的
+`chat_template` 字段就是 Qwen3 的官方 Jinja 模板，参考侧直接把它交给
+transformers 的渲染器跑（`PreTrainedTokenizerFast.chat_template = 原文`），
+不重新实现任何东西。于是对拍的对象是模板本身。
+
+**这一步不是多余的：凭记忆写必错。** 两处实测才知道的细节：
+
+| 我以为 | 实际 |
+| --- | --- |
+| 空思考块是 ` thinking\n\n\n\n` | **`<think>\n\n</think>\n\n`**，特殊 token 就叫 `<think>`(151667) / `</think>`(151668)，**没有前导空格** |
+| 只有"最后一条 assistant"才带思考块 | 条件是 `loop.index0 > last_query_index`，其中 `last_query_index` 是从后往前找的第一条"真实用户提问"（role=user 且内容不是整条 `<tool_response>` 包裹） |
+
+模板里还有两处反直觉、但错了不崩只是结果不同的分支，都在 `chat_template.cc`
+的注释里点明了：**连续的 `tool` 消息合并成一条 `<|im_start|>user`**；**tools
+分支下 messages[0] 的 system 不会在循环里重复渲染**。
+
+### 16.3 一个被对拍逼出来的地基问题
+
+第一次跑第 8 层，**`12_tricky_tool_json` 直接红了** —— 差异全在 JSON 序列化上：
+
+| 项 | 我们原来 | 官方 `tojson`（= Python `json.dumps`） |
+| --- | --- | --- |
+| 分隔符 | `{"a":1}` | `{"a": 1}`（`, ` 与 `: ` 后带空格） |
+| 浮点 | `%.17g` → `0.10000000000000001` | 最短往返 → `0.1` |
+| 整数/浮点 | 一律当 double，`1.0` 输出成 `1` | `1` 与 `1.0` 各保持原样 |
+
+改了三处：`Json::DumpPython()`（新样式）、`Json::IsIntLiteral()`（解析时记住
+字面写法）、`ShortestFloat()`（从 1 位有效数字往上试到能往返）。
+
+**这不只是"为了对拍"**：M4 的 C ABI 要把 `temperature: 0.7` 回写给宿主，
+`%.17g` 会输出 `0.69999999999999996` —— 合法但谁看了都别扭。
+
+测试用例里刻意用 `0.1` 和 `1e-05` 而不是 `0.5`：后者两种写法结果一样，测不出
+区别。这种"挑得出问题的输入"比"看起来像回事的输入"值钱。
+
+### 16.4 解析器的契约：**必须保留特殊 token**
+
+M3 端到端第一次跑也红了，而且红得有价值 —— **`<tool_call>` / `</tool_call>`
+自己就是特殊 token**（151657 / 151658）。解码时开 `skip_special` 会把这两个
+标记一起删掉，解析器只能看到裸 JSON，还会把 JSON 当成旁白念给玩家听。
+
+所以契约定成：**喂给解析器的是 `skip_special = false` 的解码文本**，"哪些标记
+不该给玩家看"由解析器的 `StripControlMarkers` 负责（`<|im_start|>` 连同紧跟的
+role 词、`<|im_end|>`、`<|endoftext|>`）。名单里刻意**不含** `<tool_call>` 与
+`<think>` —— 那两个是结构标记，得先被结构扫描消费掉。
+
+顺带得到一个好处：**宿主有没有配停止 token 都不影响解析**。M2 的
+`GenerateGreedy` 会把手上的停止 token 也放进返回序列（对齐 HF 行为），以前这
+意味着文本尾部会拖一个 `<|im_end|>`；现在解析器顺手清掉了。
+
+三个降级路径（都设了标记，宿主可以据此决定重试还是当失败）：
+
+| 情况 | 行为 |
+| --- | --- |
+| `<think>` 没闭合 | 该处到结尾都算思考内容，`unterminated_think = true` |
+| `<tool_call>` 没闭合 | 仍尝试解析并交出结果，`unterminated_tool_call = true` |
+| `arguments` 不是合法 JSON | 该调用 `ok = false`，`arguments_raw` 保留原文供宿主排查 |
+
+另外 `arguments` 是字符串时会再拆一层（有的模型会把参数序列化成字符串塞进去）。
+
+### 16.5 验证结果
+
+**第 8 层（逐字节，`python tools/check_chatml.py`）：15/15 全绿。**
+覆盖：有/无 tools、有/无 system、assistant 显式 `reasoning_content`、
+content 内嵌 `</think>`、`last_query_index` 前后、连续 tool 响应合并、
+多条 tool_calls、生成提示开关、思考模式开关、工具定义里的刁钻值
+（浮点 / 布尔 / null / 嵌套数组 / 转义 / 中文）。
+
+**进程内自检：106/106**（新增 37 项：JSON Python 样式、ChatML 渲染、输出解析）。
+
+**端到端（`python tools/check_toolcall.py`）** —— 这就是 M3 的完成判据：
+
+| 项 | 结果 |
+| --- | --- |
+| 渲染（2 个工具定义） | 1251 字节 ChatML prompt |
+| 引擎贪心生成 | 22 个 token（遇到 `<|im_end|>` 停） |
+| 与官方实现逐 token 对拍 | **22/22 一致** |
+| 解析结果 | `read_scene` / `{"scene": "神庙大厅"}`，`ok = true` |
+
+工具调用这条比自由文本更严：**只要错一个 token，JSON 就坏了**，解析会直接失败。
+所以"逐 token 一致 + 解析成功"同时成立，说明渲染、解码、解析三段都对了。
+
+### 16.6 已知限制
+
+- **不做非文本 content**：多模态数组内容会被当成空串（与官方模板对非字符串的
+  处理一致）。本引擎只处理文本。
+- **不做通用模板**：只实现 Qwen3 这一个模板。换模型族要加一个渲染函数，不是
+  配一个模板 —— 这是刻意的（见 §6：不引入 Jinja）。
+- **空 messages** 会渲染出生成提示而不是报错。官方 HF 是直接抛异常
+  （"Cannot apply chat template to an empty conversation"），所以这条没有对拍
+  参照，属于我们自己的约定。
+- **解析器不校验 name 是否在工具集里** —— 那是宿主的护栏（对齐"护栏做在工具
+  体里"），引擎只负责把名字和参数取出来。
+
+### 16.7 下一步（M4）
+
+把 `src/engine_stub.cc` 换成真实现：模型注册表 + 会话注册表 + ABI 边界异常翻译。
+M3 已经把 M4 需要的东西都准备好了 —— `ParseMessages` / `ParseTools` /
+`RenderChatml` / `ParseModelOutput` 就是 `rpg_engine_generate` 的主体，
+剩下的主要是句柄管理、最长公共前缀匹配与 JSON 请求/响应的拼装。
+
+注意 M4 解码时**不要**用 `skip_special`（理由见 §16.4）。
