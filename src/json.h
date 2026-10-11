@@ -29,10 +29,13 @@ class Json {
   Json() = default;
   Json(std::nullptr_t) {}
   Json(bool b) : type_(Type::kBool), bool_(b) {}
-  Json(int v) : type_(Type::kNumber), num_(static_cast<double>(v)) {}
-  Json(int64_t v) : type_(Type::kNumber), num_(static_cast<double>(v)) {}
-  Json(uint32_t v) : type_(Type::kNumber), num_(static_cast<double>(v)) {}
-  Json(uint64_t v) : type_(Type::kNumber), num_(static_cast<double>(v)) {}
+  Json(int v) : type_(Type::kNumber), num_(static_cast<double>(v)), int_literal_(true) {}
+  Json(int64_t v)
+      : type_(Type::kNumber), num_(static_cast<double>(v)), int_literal_(true) {}
+  Json(uint32_t v)
+      : type_(Type::kNumber), num_(static_cast<double>(v)), int_literal_(true) {}
+  Json(uint64_t v)
+      : type_(Type::kNumber), num_(static_cast<double>(v)), int_literal_(true) {}
   Json(float v) : type_(Type::kNumber), num_(static_cast<double>(v)) {}
   Json(double v) : type_(Type::kNumber), num_(v) {}
   Json(const char* s) : type_(Type::kString), str_(s) {}
@@ -71,6 +74,12 @@ class Json {
     return type_ == Type::kNumber ? static_cast<int64_t>(num_) : def;
   }
   int AsInt32(int def = 0) const { return static_cast<int>(AsInt(def)); }
+
+  // 这个数字在文本里是不是"整数写法"（`1` 而不是 `1.0`）。
+  // JSON 里这两者字节不同，而工具定义是要**原样回写**进 prompt 的，
+  // 所以我们保留字面写法，而不是一律当 double 再猜。
+  bool IsIntLiteral() const { return int_literal_; }
+  void SetIntLiteral(bool v) { int_literal_ = v; }
   const std::string& AsString() const { return str_; }
   std::string AsString(const std::string& def) const {
     return type_ == Type::kString ? str_ : def;
@@ -111,6 +120,10 @@ class Json {
 
   // ---- 序列化 / 解析 ----
   std::string Dump(bool pretty = false, int indent = 0) const;
+  // Python 的 json.dumps(obj, ensure_ascii=False) 默认样式：分隔符是 ", " 与 ": "。
+  // 用在把宿主的工具定义原样渲染进 prompt 的地方 —— Qwen3 的 ChatML 模板里
+  // 用 Jinja 的 tojson 过滤器，输出就是这个样式，逐字节对拍要求我们复刻它。
+  std::string DumpPython() const;
 
   // 解析失败返回 null 类型，并把原因写进 err（err 可为 nullptr）。
   static Json Parse(const std::string& text, std::string* err = nullptr);
@@ -125,6 +138,8 @@ class Json {
   Type type_ = Type::kNull;
   bool bool_ = false;
   double num_ = 0.0;
+  // 数字是否写成整数形式（见 IsIntLiteral）。
+  bool int_literal_ = false;
   std::string str_;
   std::vector<Json> arr_;
   std::vector<std::pair<std::string, Json>> obj_;

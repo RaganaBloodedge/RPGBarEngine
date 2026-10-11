@@ -270,6 +270,10 @@ class Parser {
     if (!any) return Fail("不是合法的数字");
     const std::string num = s_.substr(start, i_ - start);
     *out = Json(std::strtod(num.c_str(), nullptr));
+    // 记住字面写法：`1` 与 `1.0` 值相同但字节不同，工具定义要原样回写。
+    out->SetIntLiteral(num.find('.') == std::string::npos &&
+                       num.find('e') == std::string::npos &&
+                       num.find('E') == std::string::npos);
     return true;
   }
 
@@ -302,24 +306,50 @@ void DumpString(std::string& out, const std::string& s) {
   out.push_back('"');
 }
 
-void DumpNumber(std::string& out, double v) {
+// 最短的、能往返回来的小数表示 —— 就是 Python 的 repr(float) 那一套。
+//
+// 为什么不能用 "%.17g"：它给出的是"精确到 double 位数"的写法，
+// 0.7 会变成 0.69999999999999996。合法，但没法与官方实现逐字节对齐，
+// 而工具定义是要原样渲染进 prompt 的。
+//
+// 做法：从 1 位有效数字开始试，谁先能原样解析回来就用谁（double 最多 17 位
+// 有效数字一定能往返，所以循环必然命中）。
+std::string ShortestFloat(double v) {
+  char buf[64] = {0};
+  for (int p = 1; p <= 17; ++p) {
+    std::snprintf(buf, sizeof(buf), "%.*g", p, v);
+    if (std::strtod(buf, nullptr) == v) break;
+  }
+  std::string s = buf;
+  // Python 里 float 一定有 '.' 或 'e'（1.0 而非 1），补上以免与整数混淆。
+  const bool looks_float = s.find('.') != std::string::npos ||
+                           s.find('e') != std::string::npos ||
+                           s.find('E') != std::string::npos ||
+                           s.find("inf") != std::string::npos ||
+                           s.find("nan") != std::string::npos;
+  if (!looks_float) s += ".0";
+  return s;
+}
+
+void DumpNumber(std::string& out, const Json& j) {
+  const double v = j.AsDouble();
   if (!std::isfinite(v)) {
     out += "null";  // JSON 没有 NaN / Inf
     return;
   }
-  // 整数值不带小数点输出，避免 "max_tokens": 256.0 这种噪音。
-  if (v == std::floor(v) && std::fabs(v) < 9.007199254740992e15) {
+  // 整数字面量就按整数写（"max_tokens": 256 而不是 256.0 或 2.56e2）。
+  // 超出 int64 能表示的范围时才退回浮点写法。
+  if (j.IsIntLiteral() && std::fabs(v) < 9.007199254740992e15) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(v));
     out += buf;
     return;
   }
-  char buf[40];
-  std::snprintf(buf, sizeof(buf), "%.17g", v);
-  out += buf;
+  out += ShortestFloat(v);
 }
 
-void DumpValue(std::string& out, const Json& j, bool pretty, int indent) {
+void DumpValue(std::string& out, const Json& j, bool pretty, int indent,
+               bool python_sep) {
   const auto newline_indent = [&](int n) {
     if (!pretty) return;
     out.push_back('\n');
@@ -329,7 +359,7 @@ void DumpValue(std::string& out, const Json& j, bool pretty, int indent) {
   switch (j.type()) {
     case Json::Type::kNull: out += "null"; break;
     case Json::Type::kBool: out += j.AsBool() ? "true" : "false"; break;
-    case Json::Type::kNumber: DumpNumber(out, j.AsDouble()); break;
+    case Json::Type::kNumber: DumpNumber(out, j); break;
     case Json::Type::kString: DumpString(out, j.AsString()); break;
     case Json::Type::kArray: {
       if (j.elements().empty()) {
@@ -339,10 +369,10 @@ void DumpValue(std::string& out, const Json& j, bool pretty, int indent) {
       out.push_back('[');
       bool first = true;
       for (const auto& e : j.elements()) {
-        if (!first) out.push_back(',');
+        if (!first) out += python_sep ? ", " : ",";
         first = false;
         newline_indent(indent + 1);
-        DumpValue(out, e, pretty, indent + 1);
+        DumpValue(out, e, pretty, indent + 1, python_sep);
       }
       newline_indent(indent);
       out.push_back(']');
@@ -356,13 +386,13 @@ void DumpValue(std::string& out, const Json& j, bool pretty, int indent) {
       out.push_back('{');
       bool first = true;
       for (const auto& kv : j.items()) {
-        if (!first) out.push_back(',');
+        if (!first) out += python_sep ? ", " : ",";
         first = false;
         newline_indent(indent + 1);
         DumpString(out, kv.first);
         out.push_back(':');
-        if (pretty) out.push_back(' ');
-        DumpValue(out, kv.second, pretty, indent + 1);
+        if (pretty || python_sep) out.push_back(' ');
+        DumpValue(out, kv.second, pretty, indent + 1, python_sep);
       }
       newline_indent(indent);
       out.push_back('}');
@@ -412,7 +442,14 @@ void Json::Set(const std::string& key, Json v) {
 std::string Json::Dump(bool pretty, int indent) const {
   std::string out;
   out.reserve(256);
-  DumpValue(out, *this, pretty, indent);
+  DumpValue(out, *this, pretty, indent, /*python_sep=*/false);
+  return out;
+}
+
+std::string Json::DumpPython() const {
+  std::string out;
+  out.reserve(256);
+  DumpValue(out, *this, /*pretty=*/false, /*indent=*/0, /*python_sep=*/true);
   return out;
 }
 
