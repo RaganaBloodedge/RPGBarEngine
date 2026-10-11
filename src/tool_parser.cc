@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "common.h"
+
 namespace rpg {
 namespace {
 
@@ -27,6 +29,31 @@ std::string TrimAscii(const std::string& s) {
   return s.substr(b, e - b);
 }
 
+// 解析出**不可用**的工具调用时记一条日志。
+//
+// 为什么不把原文（arguments_raw）放进响应里：**响应是给游戏的，日志是给排错的**。
+// 宿主拿到 `arguments: null` 已经够它决定"这次调用不可用"；而 arguments_raw 是
+// 模型吐坏 JSON 时的原始片段，只在排错时有用，且内容完全由模型自由发挥 —— 塞进
+// 响应会把"引擎只解析、不判断合法性"的契约搅浑，也让每个宿主都得自己决定要不要
+// 忽略它。钉在日志里，两边都干净。
+//
+// 默认级别（info）就能看到：定位"模型偶尔不按格式出牌"这类问题，靠的就是这条。
+void LogInvalidCall(const ParsedToolCall& call) {
+  if (call.name.empty() && call.arguments_raw.empty()) {
+    RPG_LOG_WARN("工具调用不可用：<tool_call> 里没有可解析的 name / arguments");
+    return;
+  }
+  if (call.name.empty()) {
+    RPG_LOG_WARN("工具调用不可用：name 为空（参数原文 arguments_raw=%s）",
+                 call.arguments_raw.c_str());
+    return;
+  }
+  RPG_LOG_WARN(
+      "工具调用不可用：name=\"%s\" 的 arguments 不是合法 JSON 对象"
+      "（参数原文 arguments_raw=%s）",
+      call.name.c_str(), call.arguments_raw.c_str());
+}
+
 // 从 `<tool_call>` 的内容里取 name / arguments。
 // 体内容形如 {"name": "read_scene", "arguments": {"scene": "temple"}}。
 ParsedToolCall ParseOneCall(const std::string& body) {
@@ -35,6 +62,7 @@ ParsedToolCall ParseOneCall(const std::string& body) {
   const Json j = Json::Parse(TrimAscii(body), &err);
   if (!j.IsObject()) {
     call.arguments_raw = TrimAscii(body);
+    LogInvalidCall(call);
     return call;
   }
   call.name = j.Get("name").AsString("");
@@ -52,6 +80,7 @@ ParsedToolCall ParseOneCall(const std::string& body) {
   }
 
   call.ok = !call.name.empty() && call.arguments.IsObject();
+  if (!call.ok) LogInvalidCall(call);
   return call;
 }
 
