@@ -41,10 +41,13 @@ PRESETS = {
         "大档 DM 权重，Q4_K_M，约 2.5 GiB。"),
 }
 
-# 对拍参考物：只用官方 Qwen3-1.7B 的分词器定义。
+# 对拍参考物：只用官方 Qwen3-1.7B 的分词器定义与 chat 模板。
 REFS = [
     ("Qwen/Qwen3-1.7B", "tokenizer.json", "qwen3-1.7b-tokenizer.json",
      "官方分词器定义（HF tokenizers 格式），tools/tok_ref.py 的权威参考。"),
+    ("Qwen/Qwen3-1.7B", "tokenizer_config.json", "tokenizer_config.json",
+     "官方 chat_template 原文（Jinja 字符串），tools/check_chatml.py 的权威参考。\n"
+     "     M3 的 ChatML 渲染就是照它复刻的 —— 没有它就没法逐字节对拍。"),
 ]
 
 

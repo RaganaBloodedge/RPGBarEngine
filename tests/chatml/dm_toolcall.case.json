@@ -1,0 +1,44 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "你是一位文字跑团的主持人（DM）。当玩家要求你查看场景、检定或移动时，必须调用相应工具，不要凭记忆作答。"
+    },
+    {
+      "role": "user",
+      "content": "我举起火把，仔细查看神庙大厅里有什么。"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_scene",
+        "description": "读取当前场景的公开描述与出口",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "scene": {"type": "string", "description": "场景 id"}
+          },
+          "required": ["scene"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "roll_check",
+        "description": "请求服务端掷一次检定骰",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "skill": {"type": "string", "description": "技能名，如 力量 / 侦查"},
+            "dc": {"type": "integer", "description": "难度值"}
+          },
+          "required": ["skill", "dc"]
+        }
+      }
+    }
+  ],
+  "enable_thinking": false
+}

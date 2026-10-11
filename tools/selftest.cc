@@ -19,10 +19,12 @@
 #include <vector>
 
 #include "bytes.h"
+#include "chat_template.h"
 #include "common.h"
 #include "dtypes.h"
 #include "json.h"
 #include "quant.h"
+#include "tool_parser.h"
 #include "unicode.h"
 
 namespace {
@@ -209,6 +211,204 @@ void TestJson() {
         "控制字符与引号往返");
 }
 
+// ---------------------------------------------------------------- JSON（Python 样式）
+
+void TestJsonPython() {
+  std::printf("[json: Python 样式]\n");
+
+  // 分隔符：官方模板的 tojson 过滤器就是 json.dumps 的默认样式。
+  const rpg::Json obj =
+      rpg::Json::Parse("{\"a\":1,\"b\":[1,2],\"c\":{\"d\":\"x\"}}");
+  Check(obj.DumpPython() == "{\"a\": 1, \"b\": [1, 2], \"c\": {\"d\": \"x\"}}",
+        "DumpPython 分隔符与 json.dumps 一致");
+  Check(obj.Dump() == "{\"a\":1,\"b\":[1,2],\"c\":{\"d\":\"x\"}}",
+        "紧凑 Dump 未被改变");
+
+  // 整数字面量与浮点字面量：值一样、写法不同，回写时要保持原样。
+  Check(rpg::Json::Parse("1").Dump() == "1", "\"1\" 保持整数写法");
+  Check(rpg::Json::Parse("1.0").Dump() == "1.0", "\"1.0\" 保持浮点写法");
+  Check(rpg::Json::Parse("[1,2.5]").DumpPython() == "[1, 2.5]", "混合数组");
+
+  // 最短往返表示。"%.17g" 会把 0.1 写成 0.10000000000000001。
+  Check(rpg::Json(0.1).Dump() == "0.1", "0.1 用最短表示");
+  Check(rpg::Json(1e-5).Dump() == "1e-05", "1e-05 用最短表示");
+  Check(rpg::Json(1.0).Dump() == "1.0", "整值浮点补 .0");
+  Check(rpg::Json(123.456).Dump() == "123.456", "123.456 往返");
+  Check(rpg::Json(-0.0).Dump() == "-0.0", "-0.0");
+
+  std::string err;
+  const rpg::Json rt = rpg::Json::Parse("[0.1,1e-05,1.0,-0.0]", &err);
+  Check(err.empty() && rt.Dump() == "[0.1,1e-05,1.0,-0.0]", "浮点写法往返稳定");
+}
+
+// ---------------------------------------------------------------- ChatML 渲染
+
+void TestChatTemplate() {
+  std::printf("[ChatML 渲染]\n");
+  using rpg::ChatMessage;
+  using rpg::ChatTemplateOptions;
+
+  auto mk = [](const char* role, const char* content) {
+    ChatMessage m;
+    m.role = role;
+    m.content = content;
+    return m;
+  };
+
+  // 非思考模式：末尾补一个空的 <think>…</think>。
+  {
+    std::vector<ChatMessage> msgs = {mk("system", "你是 DM。"), mk("user", "我撬箱子。")};
+    ChatTemplateOptions opt;
+    opt.enable_thinking = false;
+    const std::string s = rpg::RenderChatml(msgs, rpg::Json(), opt);
+    Check(s ==
+              "<|im_start|>system\n你是 DM。<|im_end|>\n"
+              "<|im_start|>user\n我撬箱子。<|im_end|>\n"
+              "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+          "无工具 + 非思考：补空思考块");
+  }
+
+  // 思考模式（缺省）：不补。
+  {
+    std::vector<ChatMessage> msgs = {mk("user", "我撬箱子。")};
+    const std::string s = rpg::RenderChatml(msgs, rpg::Json());
+    Check(s == "<|im_start|>user\n我撬箱子。<|im_end|>\n<|im_start|>assistant\n",
+          "思考模式不补空思考块");
+  }
+
+  // 有工具：system 内容与工具前言合并在同一条 system 里。
+  {
+    const rpg::Json tools = rpg::Json::Parse(
+        "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"description\":\"d\"}}]");
+    std::vector<ChatMessage> msgs = {mk("system", "你是 DM。"), mk("user", "来")};
+    const std::string s = rpg::RenderChatml(msgs, tools);
+    Check(s.find("<|im_start|>system\n你是 DM。\n\n# Tools") == 0,
+          "有工具：system 与工具前言合并");
+    Check(s.find("</tools>\n\nFor each function call") != std::string::npos,
+          "有工具：前言结尾正确");
+    Check(s.find("{\"type\": \"function\", \"function\": {\"name\": \"f\"") !=
+              std::string::npos,
+          "有工具：定义用 Python JSON 样式渲染");
+  }
+
+  // 连续的 tool 消息合并成一条 user，各自包一层 tool_response。
+  {
+    ChatTemplateOptions opt;
+    opt.add_generation_prompt = false;
+    ChatMessage a;
+    a.role = "assistant";
+    a.tool_calls.push_back({"f", "{}"});
+    ChatMessage t1 = mk("tool", "{\"a\":1}");
+    ChatMessage t2 = mk("tool", "{\"b\":2}");
+    std::vector<ChatMessage> msgs = {a, t1, t2};
+    const std::string s = rpg::RenderChatml(msgs, rpg::Json(), opt);
+    Check(s.find("<|im_start|>user\n<tool_response>\n{\"a\":1}\n</tool_response>\n"
+                 "<tool_response>\n{\"b\":2}\n</tool_response><|im_end|>\n") !=
+              std::string::npos,
+          "连续 tool 消息合并成一条 user");
+    Check(s.find("<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>") !=
+              std::string::npos,
+          "assistant 的 tool_calls 按官方格式渲染");
+  }
+
+  // assistant 的思考块只在"最后一次真实提问之后"渲染。
+  {
+    ChatMessage a;
+    a.role = "assistant";
+    a.content = "箱子纹丝不动。";
+    a.reasoning_content = "先看力量。";
+    a.has_reasoning = true;  // "给了空串"与"没给"在官方模板里是两条分支
+    std::vector<ChatMessage> msgs = {mk("user", "我撬箱子。"), a};
+    const std::string s = rpg::RenderChatml(msgs, rpg::Json());
+    Check(s.find("assistant\n<think>\n先看力量。\n</think>\n\n箱子纹丝不动。") !=
+              std::string::npos,
+          "最后一条 assistant 渲染思考块");
+  }
+}
+
+// ---------------------------------------------------------------- 输出解析
+
+void TestToolParser() {
+  std::printf("[输出解析]\n");
+
+  {
+    const rpg::ParsedOutput o = rpg::ParseModelOutput("  箱子纹丝不动。\n");
+    Check(o.text == "箱子纹丝不动。" && o.tool_calls.empty() && o.reasoning.empty(),
+          "纯文本：两端空白去掉");
+  }
+  {
+    const rpg::ParsedOutput o =
+        rpg::ParseModelOutput("<think>\n先看力量。\n</think>\n\n箱子纹丝不动。");
+    Check(o.text == "箱子纹丝不动。" && o.reasoning == "\n先看力量。\n",
+          "思考块剥离，内容单独给出");
+    Check(!o.unterminated_think, "闭合的思考块不标记截断");
+  }
+  {
+    const rpg::ParsedOutput o = rpg::ParseModelOutput("<think>还在想");
+    Check(o.unterminated_think && o.text.empty() && o.reasoning == "还在想",
+          "未闭合思考块：整段算思考并打标记");
+  }
+  {
+    const rpg::ParsedOutput o = rpg::ParseModelOutput(
+        "<tool_call>\n{\"name\": \"read_scene\", \"arguments\": {\"scene\": \"temple\"}}\n"
+        "</tool_call>");
+    Check(o.tool_calls.size() == 1 && o.tool_calls[0].ok, "单工具调用");
+    Check(o.tool_calls[0].name == "read_scene", "工具名");
+    Check(o.tool_calls[0].arguments["scene"].AsString() == "temple", "参数对象");
+    Check(o.text.empty(), "只有工具调用时文本为空");
+  }
+  {
+    const rpg::ParsedOutput o = rpg::ParseModelOutput(
+        "我先看看。\n<tool_call>\n{\"name\":\"a\",\"arguments\":{}}\n</tool_call>\n"
+        "<tool_call>\n{\"name\":\"b\",\"arguments\":{\"x\":1}}\n</tool_call>\n结束");
+    Check(o.tool_calls.size() == 2, "两个工具调用");
+    Check(o.tool_calls[0].name == "a" && o.tool_calls[1].name == "b", "调用顺序");
+    Check(o.tool_calls[1].arguments["x"].AsInt() == 1, "第二个调用的参数");
+    Check(o.text.compare(0, 15, "我先看看。") == 0 &&
+              o.text.compare(o.text.size() - 6, 6, "结束") == 0,
+          "文本被拼回并去掉首尾空白");
+  }
+  {
+    const rpg::ParsedOutput o = rpg::ParseModelOutput(
+        "<tool_call>{\"name\":\"a\",\"arguments\":\"{\\\"x\\\":2}\"}</tool_call>");
+    Check(o.tool_calls.size() == 1 && o.tool_calls[0].ok &&
+              o.tool_calls[0].arguments["x"].AsInt() == 2,
+          "arguments 是字符串时也拆开");
+  }
+  {
+    const rpg::ParsedOutput o = rpg::ParseModelOutput(
+        "<tool_call>{\"name\":\"a\",\"arguments\":{oops}</tool_call>");
+    Check(o.tool_calls.size() == 1 && !o.tool_calls[0].ok, "非法参数标记为不可用");
+  }
+  {
+    const rpg::ParsedOutput o =
+        rpg::ParseModelOutput("<tool_call>{\"name\":\"a\",\"arguments\":{}}");
+    Check(o.unterminated_tool_call && o.tool_calls.size() == 1 && o.tool_calls[0].ok,
+          "未闭合工具调用：仍解析并打标记");
+  }
+  {
+    // 思考块里的 <tool_call> 字样不该被当成真的调用（先剥思考块再抽调用）。
+    const rpg::ParsedOutput o = rpg::ParseModelOutput(
+        "<think>要不要调 <tool_call> 呢</think>答案是：不用。");
+    Check(o.tool_calls.empty() && o.text == "答案是：不用。",
+          "思考块内的 <tool_call> 字样不误判");
+  }
+  {
+    // 控制类特殊 token 由解析器清掉。理由：<tool_call> 自己就是特殊 token，
+    // 解码时没法用 skip_special 过滤（会把结构标记一起删掉）。
+    const rpg::ParsedOutput o = rpg::ParseModelOutput(
+        "<|im_start|>assistant\n你好。<|im_end|><|endoftext|>");
+    Check(o.text == "你好。", "控制标记（含紧跟的 role 词）被清掉");
+  }
+  {
+    const rpg::ParsedOutput o = rpg::ParseModelOutput(
+        "<|im_start|>assistant\n<tool_call>\n{\"name\":\"a\",\"arguments\":{}}\n"
+        "</tool_call><|im_end|>");
+    Check(o.text.empty() && o.tool_calls.size() == 1 && o.tool_calls[0].ok,
+          "带控制标记的真实输出形态可解析");
+  }
+}
+
 // ---------------------------------------------------------------- 量化解码（简单类型）
 
 void TestSimpleQuants() {
@@ -340,6 +540,9 @@ int main(int argc, char** argv) {
   TestByteMap();
   TestUnicodeCategories();
   TestJson();
+  TestJsonPython();
+  TestChatTemplate();
+  TestToolParser();
   TestSimpleQuants();
 
   std::printf("\n通过 %d，失败 %d\n", g_pass, g_fail);
