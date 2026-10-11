@@ -17,9 +17,10 @@
 //     输出的累加顺序（浮点加法不满足结合律，改顺序 = 换答案）；
 //   * 所有缓冲一次性按最长序列分配，不在热路径里 new。
 //
-// **引擎内没有随机数生成器，也不该有。** 本文件只实现贪心解码（argmax），
-// 它不需要随机数。温度 / top-p 采样所需的那一个 [0,1) 由宿主提供 ——
-// 见 docs/DESIGN.md §12 #6。
+// **引擎里没有有状态的随机数生成器。** 采样（M2.5）用 counter-based 随机源
+// u = H(seed, 绝对位置)，它是纯函数（见 sampler.h）：同一个 seed + 同一段
+// prompt 必得同一局剧情。温度的"创造力"与随机数的"掷骰子"是两条互不干涉的
+// 链 —— 温度只缩放 logits，随机数只由 seed 决定 —— 见 docs/DESIGN.md §12 #6。
 
 #ifndef RPGBAR_QWEN3_H_
 #define RPGBAR_QWEN3_H_
@@ -29,6 +30,7 @@
 
 #include "kv_cache.h"
 #include "model.h"
+#include "sampler.h"
 
 namespace rpg {
 
@@ -109,11 +111,28 @@ struct GenerateOptions {
   // 命中任一 id 即停。停止 token 本身**计入**返回序列（与 HF generate 的
   // 行为一致 —— 它也会把 eos 放进输出）。空则只按 max_tokens 停。
   std::vector<int32_t> stop_ids;
+  // 采样参数（M2.5）。sample.temperature <= 0 即贪心 —— 此时行为与 M2 的
+  // 纯贪心完全一样，且**不消耗任何随机数**（向后兼容：不传 temperature 的
+  // 老请求只会走贪心）。
+  SampleOptions sample;
+  // 采样种子。引擎按 u_i = CounterUniform(seed, 绝对位置) 展开成随机序列，
+  // 是纯函数：同一 seed + 同一段 prompt → 同一串随机数 → 同一局剧情。
+  // 位置取 KV Cache 的绝对下标，所以暖缓存（续写）与冷缓存（从头）逐位一致。
+  uint64_t seed = 0;
 };
 
-// 贪心解码。cache 里应已有 prompt 的 K/V（先调一次 ForwardFull 做 prefill），
+// 生成。cache 里应已有 prompt 的 K/V（先调一次 ForwardFull 做 prefill），
 // first_logits 是"下一个 token"的分布（[vocab]，即 prefill 最后一个位置那行）。
-// 生成的 token 追加进 out_ids（不含 prompt）。**全程无随机数。**
+// 生成的 token 追加进 out_ids（不含 prompt）。
+//
+//   * sample.temperature <= 0 —— 贪心（argmax），与 GenerateGreedy 等价；
+//   * 否则 —— 每个 token 用 counter-based 随机源抽一次样。
+void Generate(const Model& m, KvCache* kv, ForwardScratch* s,
+              const float* first_logits, const GenerateOptions& opt,
+              std::vector<int32_t>* out_ids);
+
+// 贪心解码。等价于把 sample.temperature 置 0 的 Generate。M2 的逐 token
+// 对拍判据仍然走它。
 void GenerateGreedy(const Model& m, KvCache* kv, ForwardScratch* s,
                     const float* first_logits, const GenerateOptions& opt,
                     std::vector<int32_t>* out_ids);

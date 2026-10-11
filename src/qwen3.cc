@@ -288,11 +288,11 @@ void ForwardStep(const Model& m, int32_t token, int64_t pos, KvCache* kv,
   ForwardFull(m, &token, 1, s, logits, ForwardOptions(), kv);
 }
 
-void GenerateGreedy(const Model& m, KvCache* kv, ForwardScratch* s,
-                    const float* first_logits, const GenerateOptions& opt,
-                    std::vector<int32_t>* out_ids) {
+void Generate(const Model& m, KvCache* kv, ForwardScratch* s,
+              const float* first_logits, const GenerateOptions& opt,
+              std::vector<int32_t>* out_ids) {
   const ModelConfig& c = m.config();
-  RPG_CHECK(kv != nullptr, "GenerateGreedy 需要 KV Cache");
+  RPG_CHECK(kv != nullptr, "Generate 需要 KV Cache");
   RPG_CHECK(first_logits != nullptr, "first_logits 为空（prefill 之后才有）");
   RPG_CHECK(opt.max_tokens > 0, "max_tokens 必须为正，给了 %d", opt.max_tokens);
 
@@ -300,9 +300,21 @@ void GenerateGreedy(const Model& m, KvCache* kv, ForwardScratch* s,
   // 不该被这里覆盖。
   std::vector<float> logits(first_logits,
                             first_logits + static_cast<size_t>(c.vocab));
+  // 贪心不消耗随机数。这条分支让"不传 temperature"的老路径与 M2 逐位一致。
+  const bool greedy = !(opt.sample.temperature > 0.0f);
 
   for (int32_t i = 0; i < opt.max_tokens; ++i) {
-    const int32_t next = ArgMax(logits.data(), c.vocab);
+    int32_t next;
+    if (greedy) {
+      next = ArgMax(logits.data(), c.vocab);
+    } else {
+      // 绝对位置 = 这个 token 将要落进 cache 的下标（此刻还没写进去）。
+      // 用绝对下标而不是"本轮第几个"：宿主每轮重发完整 messages 时，同一段
+      // 前缀的位置不变，于是暖缓存（续写）与冷缓存（从头）会拿到同一个 u。
+      const uint64_t counter = static_cast<uint64_t>(kv->len());
+      const float u = CounterUniform(opt.seed, counter);
+      next = SampleToken(logits.data(), c.vocab, opt.sample, u);
+    }
     out_ids->push_back(next);
 
     bool stop = false;
@@ -329,6 +341,14 @@ void GenerateGreedy(const Model& m, KvCache* kv, ForwardScratch* s,
     ForwardStep(m, next, kv->len(), kv, s, &logits);
     if (stop) break;
   }
+}
+
+void GenerateGreedy(const Model& m, KvCache* kv, ForwardScratch* s,
+                    const float* first_logits, const GenerateOptions& opt,
+                    std::vector<int32_t>* out_ids) {
+  GenerateOptions g = opt;
+  g.sample.temperature = 0.0f;  // 贪心：与 M2 的行为逐位一致
+  Generate(m, kv, s, first_logits, g, out_ids);
 }
 
 }  // namespace rpg

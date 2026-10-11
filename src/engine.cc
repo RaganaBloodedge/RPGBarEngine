@@ -38,12 +38,19 @@
 namespace {
 
 // 引擎版本。与 CMakeLists.txt 的 project(VERSION) 保持一致。
-constexpr const char* kEngineVersion = "0.1.0";
+constexpr const char* kEngineVersion = "0.2.0";
 
 // 请求/会话配置里没给 max_tokens 时的默认值。
 constexpr int32_t kDefaultMaxTokens = 256;
 // KV Cache 里给停止标记与端点检查留的余量。
 constexpr int64_t kSeqMargin = 4;
+
+// 采样的引擎侧兜底。宿主只需要调 temperature —— top_k / top_p 由引擎钉住，
+// 宿主不必理解两者怎么互相作用（DESIGN §12 #6 的"滑动变阻器"口径）。
+constexpr int32_t kDefaultTopK = 0;     // 0 = 关闭 top_k
+constexpr float kDefaultTopP = 0.95f;   // 核采样：挡住长尾的胡言乱语
+// 温度上限。超过 2.0 之后输出基本读不通，钳住并打警告（是护栏，不是限制）。
+constexpr float kMaxTemperature = 2.0f;
 
 // ---------------------------------------------------------------- 注册表
 
@@ -63,6 +70,11 @@ struct Session {
   // 会话级默认生成参数（session_json 可覆盖，请求里的同名字段优先级更高）。
   int32_t max_tokens = kDefaultMaxTokens;
   std::vector<std::string> stop;
+
+  // 会话级默认采样参数。temperature <= 0 即贪心 —— 这是默认值，保证"不传
+  // temperature 的老请求"行为不变（M4 之前一律贪心）。
+  float temperature = 0.0f;
+  uint64_t seed = 0;
 };
 
 struct ModelEntry {
@@ -278,6 +290,18 @@ int32_t rpg_engine_session_create(int32_t model, const char* session_json) {
       }
     }
 
+    // 会话级默认采样参数。temperature <= 0 = 贪心，是默认值 —— 保证老请求
+    // （不传 temperature）与 M4 的行为逐位一致。
+    s->temperature = cfg.Get("temperature").AsFloat(s->temperature);
+    if (s->temperature < 0.0f) s->temperature = 0.0f;
+    if (s->temperature > kMaxTemperature) {
+      RPG_LOG_WARN("session_json.temperature=%.3f 超过上限 %.1f，已钳制",
+                   s->temperature, kMaxTemperature);
+      s->temperature = kMaxTemperature;
+    }
+    s->seed = static_cast<uint64_t>(
+        cfg.Get("seed").AsInt(static_cast<int64_t>(s->seed)));
+
     RPG_CHECK(g_next_session > 0, "会话句柄已耗尽（进程内已创建 %d 个）",
               g_next_session - 1);
     const int32_t h = g_next_session++;
@@ -376,6 +400,18 @@ char* rpg_engine_generate(int32_t session, const char* request_json) {
     // ---------------------------------------------------------- 4. 生成长度与容量
     int32_t max_tokens = req.Get("max_tokens").AsInt32(s->max_tokens);
     if (max_tokens <= 0) max_tokens = s->max_tokens;
+
+    // 采样参数：请求优先，其次会话默认（temperature <= 0 = 贪心）。温度钳到
+    // [0, 上限] —— 旋钮拧到底也不会把模型推进"胡言乱语区"。
+    float temperature = req.Get("temperature").AsFloat(s->temperature);
+    if (temperature < 0.0f) temperature = 0.0f;
+    if (temperature > kMaxTemperature) {
+      RPG_LOG_WARN("temperature=%.3f 超过上限 %.1f，已钳制", temperature,
+                   kMaxTemperature);
+      temperature = kMaxTemperature;
+    }
+    const uint64_t seed = static_cast<uint64_t>(
+        req.Get("seed").AsInt(static_cast<int64_t>(s->seed)));
     // **所有会失败的条件检查都在这里做完**，之后才动 cache —— 否则一次失败
     // 会把会话留在"cached_ids 与 kv.len 对不上"的状态里，下一次调用直接报
     // 内部状态不一致（这个顺序是 M4 第一次跑红时定下来的）。
@@ -419,14 +455,18 @@ char* rpg_engine_generate(int32_t session, const char* request_json) {
     AppendStopStrings(tok, req.Get("stop"), &stop_ids);
     for (const std::string& sp : s->stop) AppendStopString(tok, sp, &stop_ids);
 
-    // ---------------------------------------------------------- 7. 贪心生成
+    // ---------------------------------------------------------- 7. 生成
     rpg::GenerateOptions gopt;
     gopt.max_tokens = max_tokens;
     gopt.stop_ids = stop_ids;
+    gopt.sample.temperature = temperature;
+    gopt.sample.top_k = kDefaultTopK;
+    gopt.sample.top_p = kDefaultTopP;
+    gopt.seed = seed;
 
     std::vector<int32_t> gen;
     const float* last = logits.data() + (rows - 1) * c.vocab;
-    rpg::GenerateGreedy(model, s->kv.get(), &s->scratch, last, gopt, &gen);
+    rpg::Generate(model, s->kv.get(), &s->scratch, last, gopt, &gen);
     s->cached_ids.insert(s->cached_ids.end(), gen.begin(), gen.end());
 
     // ---------------------------------------------------------- 8. 解码 + 解析
