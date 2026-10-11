@@ -3,12 +3,12 @@
 RPGBar 的内置推理引擎。目标是把"玩家要自己配模型服务"变成"装完游戏就能选到一个模型"——
 引擎编进游戏本体，权重随包分发，进程内调用，零外部依赖、零 HTTP 往返。
 
-> 状态：**M3 完成**（ChatML 渲染与官方模板逐字节一致，工具调用端到端打通）。
+> 状态：**M4 完成** —— C ABI 落地，宿主已经能真的加载权重、建会话、生成、释放。
 > 已完成：GGUF 解析 / 15 种 ggml 量化类型反量化 / Qwen BBPE 分词器 /
-> 全序列前向 / KV Cache / 贪心生成 / ChatML 模板 / tool_call 解析。
+> 全序列前向 / KV Cache / 贪心生成 / ChatML 模板 / tool_call 解析 / C ABI。
 >
 > 许可证 MIT。进度与设计依据见 `docs/DESIGN.md`：M0 见 §13，M1 见 §14，
-> M2 见 §15，M3 见 §16。**引擎不产随机性**（库里没有 RNG）—— 见下面「关于随机性」。
+> M2 见 §15，M3 见 §16，M4 见 §17。**引擎不产随机性**（库里没有 RNG）—— 见下面「关于随机性」。
 
 ## 这是什么
 
@@ -118,11 +118,20 @@ bash tools/run_checks.sh
 | 6 前向（M1） | `check_forward.py` vs PyTorch 官方 `Qwen3ForCausalLM` | 3 组合 × 29 项全绿，argmax 全一致 |
 | 7 生成（M2） | `check_generate.py` vs PyTorch 官方实现 | 3 组合 **逐 token 一致**，cache 自检逐位相同 |
 | 8 ChatML 渲染（M3） | `check_chatml.py` vs HF `apply_chat_template` 跑官方模板原文 | 15/15 用例逐**字节**一致 |
+| 9 C ABI（M4） | `check_abi.py` 用 ctypes 走 `rpg_engine.dll`（宿主视角） | 32/32：导出表、句柄生命周期、与工具链结果一致、前缀复用逐位等价 |
 
-第 6 层之后的都需要 `torch` / `transformers` / `gguf`；第 8 层另需 `jinja2`：
+第 9 层不需要 `torch`，所以它在前 8 层跑不起来的机器上照样能跑。
 
 ```bash
-pip install torch transformers gguf safetensors
+# 第 6~8 层的基准是官方实现，需要一个带 torch / transformers / gguf 的解释器。
+# run_checks.sh 默认用 PATH 上的 python，装在对地方的机器上直接跑就行：
+bash tools/run_checks.sh
+# 否则显式指定：
+PY=/path/to/python bash tools/run_checks.sh
+```
+
+```bash
+pip install torch transformers gguf safetensors jinja2
 ```
 
 单跑某一件：
@@ -137,6 +146,7 @@ python tools/check_forward.py                       # M1 全部组合
 python tools/check_generate.py                      # M2 全部组合
 python tools/check_chatml.py                        # M3 第 8 层（逐字节）
 python tools/check_toolcall.py                      # M3 端到端（工具调用）
+python tools/check_abi.py                           # M4 第 9 层（宿主视角，走 dll）
 ./build/chatml_check.exe --case tests/chatml/dm_toolcall.case.json   # 渲染一份 ChatML
 ./build/parse_check.exe --text-file runs/xxx.raw.txt                 # 解析一段输出
 python tools/check_noise_floor.py models/Qwen3-1.7B-Q8_0.gguf --layers 12 --tokens-from runs/zh.tokens.txt
@@ -183,6 +193,41 @@ python tools/check_noise_floor.py models/Qwen3-1.7B-Q8_0.gguf --layers 12 --toke
 一起删掉，解析器只能看到裸 JSON、还会把它当旁白念给玩家听。控制标记由解析器自己清。
 这条是 M3 端到端第一次跑红时踩出来的，详见 `docs/DESIGN.md` §16.4。
 
+### 关于 C ABI
+
+`include/rpg_engine.h` 是唯一的对外接口，只有 10 个 C 函数：
+
+```
+const char* rpg_engine_version(void);
+const char* rpg_engine_last_error(void);
+
+int32_t rpg_engine_load_model(const char*, const char* config_json);   // → model 句柄
+void    rpg_engine_unload_model(int32_t model);
+
+int32_t rpg_engine_session_create(int32_t model, const char* session_json);
+void    rpg_engine_session_destroy(int32_t session);
+int32_t rpg_engine_session_reset(int32_t session);
+
+char*   rpg_engine_generate(int32_t session, const char* request_json);
+void    rpg_engine_free(char* buf);
+char*   rpg_engine_model_info(int32_t model);
+```
+
+三条设计要点：
+
+- **两级句柄**。`model` 是权重（一个进程通常只加载一个），`session` 是独立推理
+  上下文（自己的 KV Cache 与 token 历史）。主机端的 DM 与小助手**共用同一份权重、
+  但会话完全隔离** —— 这是它存在的理由：把两者揉成一个句柄，就只剩"共用上下文
+  （剧透 + 串味）"或"权重加载两遍（内存翻倍）"两种坏选择。
+- **句柄只增不复用**。销毁后该句柄永久失效，宿主拿旧句柄再调用一定失败，而不是
+  像复用的文件描述符那样打到另一个对象上（那种错最难查）。
+- **异常不穿过 C ABI**。内部用异常传错误，边界处统一翻成"返回负数 / NULL +
+  `rpg_engine_last_error()`"。让 C++ 异常穿到 Unity IL2CPP 或 CPython 那边是未定义行为。
+
+一轮调用的形态：宿主每轮把**完整 messages** 传进来，引擎自己做最长公共前缀匹配，
+只对新增的部分做前向（复用的那截 KV 与重算逐位等价，第 9 层守着这条）。返回的
+`text` 已经剥掉思考块与工具调用块，工具调用单独放 `tool_calls`。
+
 ### 关于随机性：引擎里没有 RNG
 
 **库里不含任何随机数生成器，也不该有。** 理由不是洁癖，是三条实际的：
@@ -211,8 +256,9 @@ JSON 输出），调高则分布变平、更容易选到低概率的表达（更
 
 ## 当前限制
 
-- **只能贪心**：温度 / top-p / top-k 采样还没有代码（M2.5）。按上面的分工，即使做，
-  引擎也只出确定性分布，抽样由宿主完成。
+- **只能贪心**：温度 / top-p / top-k 还没有代码（M2.5）。请求里的 `temperature` /
+  `top_p` **目前只是被收下、不生效** —— 别以为调了它输出就会变。按上面的分工，即使
+  做，引擎也只出确定性分布，抽样由宿主完成。
 - **decode 与 prefill 都慢**：Q8_0 上 prefill 64 token 约 6.6 s、decode 约 9 tok/s，
   离目标 100 tok/s 差一个数量级。这是纯标量反量化点积的必然结果（读每个权重元素都要
   现反量化一次），M5 用 SIMD + 融合反量化点积解决。
@@ -220,8 +266,11 @@ JSON 输出），调高则分布变平、更容易选到低概率的表达（更
   渲染函数。这是刻意的取舍，见 `docs/DESIGN.md` §6。
 - **不做 NFC 归一化**：跟随 llama.cpp 的行为（Qwen3 的 tokenizer.json 声明了 NFC，
   但 llama.cpp 不归一化）。输入已是 NFC 时与 HF 完全一致。详见 `docs/DESIGN.md` §13.4。
-- **C ABI 还是占位实现**：除 `rpg_engine_version` 外都返回"未实现"，M4 落地。
+- **单会话不并发**：同一权重可以挂多个会话，但单个会话同一时刻只允许一个
+  `rpg_engine_generate`（宿主侧串行化）。多会话之间共享的只有只读的权重。
+- **思考块内容不返回**：响应里只有 `text` 与 `tool_calls`，`<think>` 里的内容被
+  解析器丢弃。对小助手来说这是对的（与玩家同视角），但调试时就看不到模型在想什么。
 - 只支持 Qwen3 架构；配置全部从 GGUF 读，扩族是"加一个前向 + 一套模板"，不是重写。
 
 里程碑与验收判据见 `docs/DESIGN.md` §10；M0 记录见 §13，M1 见 §14，M2 见 §15，
-M3 见 §16。
+M3 见 §16，M4 见 §17。
