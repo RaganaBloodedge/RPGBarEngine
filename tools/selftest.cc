@@ -379,6 +379,18 @@ void TestToolParser() {
     const rpg::ParsedOutput o = rpg::ParseModelOutput(
         "<tool_call>{\"name\":\"a\",\"arguments\":{oops}</tool_call>");
     Check(o.tool_calls.size() == 1 && !o.tool_calls[0].ok, "非法参数标记为不可用");
+    // 原文必须留着 —— 它是日志的素材（响应里只给 arguments: null，原文不下发）。
+    Check(o.tool_calls[0].arguments_raw == "{\"name\":\"a\",\"arguments\":{oops}",
+          "非法参数：原始文本保留，供日志定位");
+  }
+  {
+    // 整个 <tool_call> 体不是 JSON 对象（模型自由发挥）时同样保留原文。
+    const rpg::ParsedOutput o =
+        rpg::ParseModelOutput("<tool_call>掷个骰子吧</tool_call>");
+    Check(o.tool_calls.size() == 1 && !o.tool_calls[0].ok &&
+              o.tool_calls[0].name.empty() &&
+              o.tool_calls[0].arguments_raw == "掷个骰子吧",
+          "非 JSON 的工具调用块：标记不可用并保留原文");
   }
   {
     const rpg::ParsedOutput o =

@@ -123,6 +123,25 @@ def def_export_symbols() -> set[str]:
     return out
 
 
+def parser_logs_invalid_calls() -> tuple[bool, str]:
+    """静态守卫：解析层必须把"非法工具调用"记进日志，并带上模型原文。
+
+    约定是**响应的 tool_calls 里只给 `arguments: null`，原文 arguments_raw 不进
+    响应**（DESIGN §17.5）。那么原文唯一的出口就是日志 —— 这条分支要是被重构掉
+    日志，宿主排错时就没有任何线索了，而且不会有别的测试因此变红（日志不影响任何
+    返回值）。这种"删了也没人发现"的约定，值得钉一条守卫。
+    """
+    path = os.path.join(REPO, "src/tool_parser.cc")
+    if not os.path.isfile(path):
+        return False, f"找不到 {path}"
+    src = open(path, encoding="utf-8").read()
+    if "RPG_LOG_WARN" not in src:
+        return False, "tool_parser.cc 里没有 RPG_LOG_WARN：非法工具调用的日志没了"
+    if "arguments_raw.c_str()" not in src:
+        return False, "日志里没带 arguments_raw：排错时看不到模型原始输出"
+    return True, "解析层在非法工具调用分支打日志，且带上模型原文"
+
+
 def reference_via_tools(args, case_path: str) -> tuple[str, list]:
     """渲染 → 生成 → 解码 → 解析，全程走命令行工具（无 torch）。"""
     runs = args.runs
@@ -171,9 +190,12 @@ def main() -> int:
     args = ap.parse_args()
 
     problems: list[str] = []
+    passed = 0
 
     def check(cond: bool, what: str) -> None:
+        nonlocal passed
         if cond:
+            passed += 1
             print(f"  通过  {what}")
         else:
             print(f"  失败  {what}")
@@ -213,6 +235,11 @@ def main() -> int:
 
     check(lib.rpg_engine_model_info(-1) is None, "无效模型句柄 → NULL")
     check(bool(last_error(lib)), "失败时 last_error 非空")
+
+    # 接口形状守卫：两处"引擎只解析、不替宿主做决定"的约定，删了不会让别的检查
+    # 变红，所以在这里钉住。
+    ok, why = parser_logs_invalid_calls()
+    check(ok, why)
 
     # ---------------------------------------------------------- 1. 加载
     log("[1] 加载模型")
@@ -282,6 +309,16 @@ def main() -> int:
         "ABI 的工具调用与工具链路径完全相同")
     check(r_cold["usage"]["completion_tokens"] > 0, "usage 报告了生成 token 数")
 
+    # 响应形状：**恰好**四键。这是一条防回归守卫 —— 将来若"顺手"把思考内容
+    # （reasoning）或参数原文（arguments_raw）加进响应，这里会当场变红。
+    # 定案理由：响应会流到玩家侧 UI，DM 的思考里写着剧本打算（防剧透）；参数原文
+    # 走日志（见 parser_logs_invalid_calls）。
+    check(set(r_cold.keys()) == {"text", "tool_calls", "finish_reason", "usage"},
+          f"响应恰好 text/tool_calls/finish_reason/usage 四键"
+          f"（实为 {sorted(r_cold.keys())}）")
+    check(all(set(c.keys()) == {"name", "arguments"} for c in r_cold["tool_calls"]),
+          "每个 tool_call 恰好 name/arguments 两键（思考内容与参数原文不下发）")
+
     # ---------------------------------------------------------- 4. 缓存复用
     log("[4] 缓存复用：暖缓存必须与冷缓存逐字节一致")
     r_warm_same = gen(lib, s_cold, request)
@@ -332,7 +369,9 @@ def main() -> int:
     if problems:
         for p in problems:
             print(f"未通过：{p}")
+        print(f"通过 {passed} 项，失败 {len(problems)} 项。")
         return 1
+    print(f"通过 {passed} 项，失败 0 项。")
     print("通过：ABI 结构与错误通道正确、结果与工具链一致、前缀复用逐位等价。")
     return 0
 
