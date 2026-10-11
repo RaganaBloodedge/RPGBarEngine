@@ -118,7 +118,7 @@ bash tools/run_checks.sh
 | 6 前向（M1） | `check_forward.py` vs PyTorch 官方 `Qwen3ForCausalLM` | 3 组合 × 29 项全绿，argmax 全一致 |
 | 7 生成（M2） | `check_generate.py` vs PyTorch 官方实现 | 3 组合 **逐 token 一致**，cache 自检逐位相同 |
 | 8 ChatML 渲染（M3） | `check_chatml.py` vs HF `apply_chat_template` 跑官方模板原文 | 15/15 用例逐**字节**一致 |
-| 9 C ABI（M4） | `check_abi.py` 用 ctypes 走 `rpg_engine.dll`（宿主视角） | 32/32：导出表、句柄生命周期、与工具链结果一致、前缀复用逐位等价 |
+| 9 C ABI（M4） | `check_abi.py` 用 ctypes 走 `rpg_engine.dll`（宿主视角） | 35/35：导出表、句柄生命周期、与工具链结果一致、前缀复用逐位等价、响应形状 |
 
 第 9 层不需要 `torch`，所以它在前 8 层跑不起来的机器上照样能跑。
 
@@ -177,8 +177,12 @@ python tools/check_noise_floor.py models/Qwen3-1.7B-Q8_0.gguf --layers 12 --toke
    ▼ 生成
    ├─ ParseModelOutput  取出 <tool_call>{...}</tool_call>，剩下的就是"该说的话"
    ▼
-{"text": "...", "reasoning": "...", "tool_calls": [{"name":..., "arguments":{...}}]}
+{"text": "...", "tool_calls": [{"name":..., "arguments":{...}}],
+ "finish_reason": "...", "usage": {...}}
 ```
+
+解析器内部还会切出**思考块内容**（`reasoning`），但它**不出 ABI 响应** —— 见下面
+「关于输出形状」。
 
 **渲染是逐字节对着官方模板做的。** 参考侧直接取官方 `tokenizer_config.json` 里的
 `chat_template` 原文交给 HF 渲染，所以比的是模板本身。两处凭记忆一定会写错的细节：
@@ -228,6 +232,30 @@ char*   rpg_engine_model_info(int32_t model);
 只对新增的部分做前向（复用的那截 KV 与重算逐位等价，第 9 层守着这条）。返回的
 `text` 已经剥掉思考块与工具调用块，工具调用单独放 `tool_calls`。
 
+### 关于输出形状：响应里有什么、没有什么
+
+`rpg_engine_generate` 返回的 JSON **恰好四键**：
+
+| 键 | 含义 |
+| --- | --- |
+| `text` | 该说的话（已剥掉思考块与工具调用块） |
+| `tool_calls` | 结构化的调用，每项 `{name, arguments}`；参数非法时 `arguments` 为 `null` |
+| `finish_reason` | `stop` / `length` / `tool_calls` |
+| `usage` | `prompt_tokens` / `completion_tokens` |
+
+有两样东西**刻意不放进来**：
+
+- **思考块内容（`reasoning`）**。响应最终会流到玩家侧 UI，而 DM 的思考里常常写着
+  它打算怎么推进剧情——放进去等于漏剧本；小助手更是本来就该与玩家同视角。想看模型
+  在想什么，走日志，不走响应。
+- **非法参数的原文（`arguments_raw`）**。模型吐坏 JSON 时那一条给 `arguments: null`，
+  原始片段记进日志（`RPG_LOG_WARN`，前缀 `[rpg_engine warn]`，默认级别可见），带上
+  工具名与原文，方便"模型偶尔不按格式出牌"时定位。
+
+这两条**只有约定、没有编译期保障**（删掉它们不会有别的检查变红），所以
+`tools/check_abi.py` 钉了三条守卫：响应恰好四键、每个 `tool_call` 恰好两键，再加一条
+静态检查确认解析层的非法分支上仍有日志、且日志里带上了 `arguments_raw`。
+
 ### 关于随机性：引擎里没有 RNG
 
 **库里不含任何随机数生成器，也不该有。** 理由不是洁癖，是三条实际的：
@@ -268,8 +296,8 @@ JSON 输出），调高则分布变平、更容易选到低概率的表达（更
   但 llama.cpp 不归一化）。输入已是 NFC 时与 HF 完全一致。详见 `docs/DESIGN.md` §13.4。
 - **单会话不并发**：同一权重可以挂多个会话，但单个会话同一时刻只允许一个
   `rpg_engine_generate`（宿主侧串行化）。多会话之间共享的只有只读的权重。
-- **思考块内容不返回**：响应里只有 `text` 与 `tool_calls`，`<think>` 里的内容被
-  解析器丢弃。对小助手来说这是对的（与玩家同视角），但调试时就看不到模型在想什么。
+- **思考块内容不下发**：`<think>` 里的内容不进响应（防剧透，见「关于输出形状」），
+  调 DM 时想看它在想什么只能看日志。
 - 只支持 Qwen3 架构；配置全部从 GGUF 读，扩族是"加一个前向 + 一套模板"，不是重写。
 
 里程碑与验收判据见 `docs/DESIGN.md` §10；M0 记录见 §13，M1 见 §14，M2 见 §15，
