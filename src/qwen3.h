@@ -46,11 +46,15 @@ struct ForwardScratch {
   std::vector<float> proj;    // [seq, hidden]   子层输出（残差要加的那一份）
   std::vector<float> gate;    // [seq, intermediate]  SwiGLU 的 gate 与结果
   std::vector<float> up;      // [seq, intermediate]
-  std::vector<float> scores;  // 单头、单查询位置的注意力分数，长度 ≥ 查询数
+  // scores 的索引是**绝对位置**（attention 里 `s <= pos0 + t`），所以长度要求是
+  // **pos0 + seq**，不是 seq —— 前缀复用（pos0 > 0）时按 seq 备就是堆越界。
+  // 由 Ensure（只增不减，见 .cc）独占管理，不在 Ensure 里缩容。
+  std::vector<float> scores;
 
+  // 本段缓冲：按 n 重设 x/h/q/k/v/attn/proj/gate/up（它们的索引都是段内局部下标）。
   void Ensure(const ModelConfig& c, int64_t n);
-  // 增量解码时 attention 要遍历 cache 的整段历史，scores 需覆盖到 pos+1。
-  // 与 Ensure 分开是因为这里只增不减 —— 每步重新 assign 一次纯属浪费。
+  // scores 单独一个入口：只增不减（每步重新 assign 一次纯属浪费），
+  // 且 n 传的是**绝对位置数** pos0 + seq。
   void EnsureScores(int64_t n);
 };
 

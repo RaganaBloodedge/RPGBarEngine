@@ -28,6 +28,40 @@
 
 ---
 
+## [未发布]
+
+（暂无）
+
+---
+
+## [0.4.1] - 2026-10-12
+
+### 修复
+
+- **前缀复用的第二次 prefill 会越界写 `scores`，破坏堆（进程崩在分配器里）。**
+  `ForwardScratch::Ensure()` 会把 `scores` 按**本段长度** `seq` 缩容，但 attention
+  是按**绝对位置**索引它的（`AttentionFromCache` 里 `s <= pos0 + t`），长度得是
+  `pos0 + seq`。正常 prefill（`pos0 = 0`）看不出问题；一旦宿主按"每轮重发完整
+  messages"的方式续写（`pos0` = 缓存长度），多出来的 `pos0` 个 float 就写到
+  缓冲区后面去了。
+
+  症状极隐蔽，值得记下来：**单轮 prompt 完全正常**，第二轮复用前缀时进程**无声消失**
+  （Windows 上是 `0xC0000374` 堆损坏，或 `0xC0000005` 访问违例），崩溃点在堆分配器
+  里、与注意力看不出关系；同一份代码换个 prompt 长度可能又不崩（取决于堆布局），
+  极易被误判成"偶发""并发问题"甚至"模型太大"。
+
+  修法：`scores` 交由 `EnsureScores()` 独占管理（只增不减，`Ensure()` 不再碰它），
+  并要求 `ForwardFull` 按 `pos0 + seq` 备足。`ForwardStep` 里那句
+  `EnsureScores(pos + 1)` 随之去掉 —— 它本来就是为这个越界打的补丁，但被 `Ensure`
+  的缩容抵消掉了，所以只保护了增量解码、没保护带前缀复用的 prefill。
+
+- 回归测试：`tools/selftest.cc` 新增 `TestForwardScratch`，锁**缓冲区尺寸契约**
+  （`Ensure` 不动 scores、`EnsureScores` 只增不减、前缀复用时按 `pos0 + seq` 覆盖）。
+  不从数值上验 —— 越界写的是 `scores` 之外的堆，算出来的 logits 照样是对的，
+  数值对拍抓不到这个 bug。
+
+---
+
 ## [0.4.0] - 2026-10-11
 
 **M5 完成**：prefill 从 7.5 tok/s 提到 **85–91 tok/s**（累计 11.7×），decode 保持 22.9 tok/s。

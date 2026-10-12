@@ -23,12 +23,19 @@ void ForwardScratch::Ensure(const ModelConfig& c, int64_t n) {
   need(proj, n * c.hidden);
   need(gate, n * c.intermediate);
   need(up, n * c.intermediate);
-  need(scores, n);
+  // **scores 不在这里管**。上面这些缓冲的索引是**本段内的局部下标**（0..n-1），
+  // 但 scores 的索引是**绝对位置**（AttentionFromCache 里 `s <= pos0 + t`，见
+  // qwen3.cc 的注释），长度得是 pos0 + n。放在这里按 n 缩容的话，一旦前缀复用
+  // 时 pos0 > 0 就会写到缓冲区后面去 —— 那是堆越界，且症状是"过一会儿才崩"。
+  // 它由 EnsureScores 独占管理（只增不减），调用点在 ForwardFull。
   seq = n;
 }
 
 void ForwardScratch::EnsureScores(int64_t n) {
   // 只增不减：增量解码每步都会调它，缩容再扩容纯属自找。
+  //
+  // n 是**绝对位置数**（pos0 + seq），不是本段的长度 —— scores 由
+  // AttentionFromCache 按绝对位置索引。见 Ensure 里的说明。
   if (static_cast<int64_t>(scores.size()) < n) {
     scores.assign(static_cast<size_t>(n), 0.0f);
   }
@@ -232,6 +239,11 @@ void ForwardFull(const Model& m, const int32_t* tokens, int64_t seq,
         static_cast<size_t>(n_use + 1) * seq * hidden, 0.0f);
   }
   s->Ensure(c, seq);
+  // scores 按**绝对位置**备足：AttentionFromCache 会写到 [0, pos0 + seq)。
+  // 这一句是必须的，不是保险 —— 少了它，前缀复用（pos0 > 0）时 attention 会写
+  // 到 scores 缓冲区之后（堆越界）。症状极隐蔽：单轮 prompt 不崩，第二轮复用
+  // 前缀时崩，且崩溃点在堆分配器里（0xC0000374），看不出与注意力有关。
+  s->EnsureScores(pos0 + seq);
 
   // ---- embedding ----
   // Qwen3 **不**乘 sqrt(hidden)（Gemma 2 才乘）。这一点如果抄错，
@@ -283,8 +295,7 @@ void ForwardStep(const Model& m, int32_t token, int64_t pos, KvCache* kv,
   RPG_CHECK(pos == kv->len(),
             "增量解码只支持顺序追加：pos = %lld，而 cache 长度 = %lld",
             static_cast<long long>(pos), static_cast<long long>(kv->len()));
-  // attention 要遍历 [0, pos] 这段历史，缓冲得够长。
-  s->EnsureScores(pos + 1);
+  // scores 由 ForwardFull 按 pos0 + seq 备足，这里不必再管（pos0 就是 pos）。
   ForwardFull(m, &token, 1, s, logits, ForwardOptions(), kv);
 }
 

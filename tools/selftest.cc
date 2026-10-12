@@ -25,6 +25,7 @@
 #include "json.h"
 #include "matmul.h"
 #include "quant.h"
+#include "qwen3.h"
 #include "sampler.h"
 #include "tool_parser.h"
 #include "unicode.h"
@@ -873,6 +874,64 @@ void TestMatmulBlocked() {
   }
 }
 
+// ---------------------------------------------------------------- 前向缓冲契约
+//
+// 这条锁的是一个**真踩过的坑**：`scores` 的索引是**绝对位置**
+// （AttentionFromCache 里 `s <= pos0 + t`），长度必须按 `pos0 + seq` 备，
+// 而不是按本段的 `seq`。
+//
+// 曾经 `ForwardScratch::Ensure` 里有一句 `need(scores, n)`：正常 prefill
+// （pos0 = 0）看不出问题，但**前缀复用的第二次 prefill**（pos0 = 缓存长度）
+// 会先把 scores 缩到 seq，attention 再写到 seq 之后 —— 堆越界。症状极隐蔽：
+// 单轮 prompt 正常，第二轮复用前缀时进程崩在堆分配器里（0xC0000374），
+// 从崩溃点完全看不出与注意力有关。
+//
+// 这里不从数值上验（越界写的是 scores 之外的堆，算出来的 logits 照样对），
+// 而是直接锁**缓冲区的尺寸契约**：Ensure 不碰 scores，EnsureScores 只增不减。
+void TestForwardScratch() {
+  std::printf("[前向缓冲]\n");
+
+  rpg::ModelConfig c;
+  c.hidden = 8;
+  c.n_heads = 2;
+  c.n_kv_heads = 1;
+  c.head_dim = 4;
+  c.intermediate = 16;
+
+  rpg::ForwardScratch s;
+
+  // 第一次：整段 prefill（pos0 = 0），scores 应当正好覆盖 seq。
+  s.Ensure(c, 10);
+  s.EnsureScores(10);
+  Check(s.scores.size() == 10, "prefill 后 scores 覆盖 [0, seq)");
+  Check(s.seq == 10, "Ensure 记下本段长度");
+
+  // 第二次：前缀复用（pos0 = 10，seq = 4）。scores 必须覆盖 [0, 14)，
+  // 而不是被缩回 4 —— 缩回去就是越界写。
+  s.Ensure(c, 4);
+  Check(s.scores.size() == 10, "Ensure 不缩 scores（尺寸由 EnsureScores 独占）");
+  s.EnsureScores(10 + 4);
+  Check(s.scores.size() == 14, "前缀复用时 scores 覆盖 pos0 + seq");
+  Check(s.x.size() == 4 * 8, "Ensure 正常重设本段缓冲 x");
+  Check(s.q.size() == 4 * 8, "Ensure 正常重设本段缓冲 q");
+
+  // 增量解码：pos0 逐渐变大，scores 只增不减。
+  s.EnsureScores(20);
+  Check(s.scores.size() == 20, "EnsureScores 按需增长");
+  s.EnsureScores(15);
+  Check(s.scores.size() == 20, "EnsureScores 只增不减（不因 n 变小而缩容）");
+  s.Ensure(c, 1);
+  Check(s.scores.size() == 20, "增量解码一步后 scores 仍覆盖绝对位置");
+
+  // 一个位置都不能少：attention 要写 scores[0 .. pos0 + seq - 1]。
+  rpg::ForwardScratch t;
+  t.Ensure(c, 7);
+  t.EnsureScores(300);
+  t.Ensure(c, 3);
+  t.EnsureScores(300 + 3);
+  Check(t.scores.size() >= 303, "跨调用后 scores 仍覆盖 pos0 + seq");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -888,6 +947,7 @@ int main(int argc, char** argv) {
   TestJsonPython();
   TestChatTemplate();
   TestToolParser();
+  TestForwardScratch();
   TestSimpleQuants();
   TestSampler();
   TestMatmulKernels();
