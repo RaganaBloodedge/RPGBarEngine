@@ -12,7 +12,9 @@ RPGBar 的内置推理引擎。目标是把"玩家要自己配模型服务"变�
 > 全序列前向 / KV Cache / 生成（贪心 + 温度采样）/ ChatML 模板 / tool_call 解析 /
 > C ABI / **AVX2 融合点积 + 多 token 阻塞乘内核（Q4_K / Q6_K / Q8_0 / F32，带标量兜底）**。
 >
-> 许可证 MIT。进度与设计依据见 `docs/DESIGN.md`：M0 见 §13，M1 见 §14，M2 见 §15，
+> 许可证 MIT。**当前版本 `v0.4.1`**，变更记录见 [CHANGELOG.md](CHANGELOG.md)
+> （0.4.1 = 修掉前缀复用时注意力分数缓冲的越界写，并补上对应的缓冲尺寸契约自检）。
+> 进度与设计依据见 `docs/DESIGN.md`：M0 见 §13，M1 见 §14，M2 见 §15，
 > M3 见 §16，M4 见 §17，M2.5 见 §18，M5 见 §19。**引擎里没有有状态的 RNG** —— 随机性来自宿主
 > 给的 seed，引擎只做纯函数展开，见下面「关于随机性」。
 
@@ -117,7 +119,7 @@ bash tools/run_checks.sh
 
 | 层 | 手段 | 当前结果 |
 | --- | --- | --- |
-| 1 进程内自检 | `selftest.exe` | 150/150（含阻塞乘 vs 逐 token、串并行逐位相同） |
+| 1 进程内自检 | `selftest.exe` | 160/160（含阻塞乘 vs 逐 token、串并行逐位相同、前缀复用的缓冲尺寸契约） |
 | 2 量化块尺寸 | `check_quant_layout.py` 用 GGUF 写入器的 offset 反推 | 全部一致，张量无缝铺满 |
 | 3 量化语义（逐位） | `xcheck_dequant.py` vs `gguf.quants`（llama.cpp 官方算法） | **逐位相同**（含 3.1 亿元素的整张词表） |
 | 4 分词器 | `tok_ref.py` 对 HF `tokenizers` | 3031/3031 逐 id 一致 |
